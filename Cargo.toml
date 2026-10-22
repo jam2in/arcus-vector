@@ -1,6 +1,54 @@
 [package]
 name = "arcus-vector"
+description = "Vector search for arcus-memcached, loaded as an ASCII protocol extension (-X)"
 version = "0.1.0"
 edition = "2024"
+# let-chains (`if let .. && let ..`).
+rust-version = "1.88"
+publish = false
 
-[dependencies]
+[lib]
+# memcached loads the module as `libarcusv.so` with `-X`.
+name = "arcusv"
+crate-type = ["cdylib"]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_qualifications = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+trivial_numeric_casts = "warn"
+unused_import_braces = "warn"
+
+[lints.clippy]
+# Raw pointers change type with `.cast()`/`.cast_mut()`, not `as`.
+ptr_as_ptr = "warn"
+ptr_cast_constness = "warn"
+borrow_as_ptr = "warn"
+# Lossless conversions use `From`, so an `as` cast marks one that can lose.
+cast_lossless = "warn"
+manual_let_else = "warn"
+semicolon_if_nothing_returned = "warn"
+redundant_closure_for_method_calls = "warn"
+cast_ptr_alignment = "warn"
+# A daemon module must not panic on a code path a request can reach; tests may.
+# `clippy.toml` lets tests unwrap.
+unwrap_used = "warn"
+expect_used = "warn"
+# Messages go through the server's logger, which honours `-v` and logger extensions;
+# printing directly bypasses both.
+print_stderr = "warn"
+print_stdout = "warn"
+# Every `unsafe` block says why it is sound, next to it.
+undocumented_unsafe_blocks = "warn"
+unnecessary_safety_comment = "warn"
+# A lint is silenced with `#[expect(.., reason = "..")]`: the reason stays with the code, and
+# the compiler says when the exception is no longer needed.
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+# Leaks are deliberate here (never free under the cache lock); each one says so.
+mem_forget = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+use_self = "warn"
+or_fun_call = "warn"
