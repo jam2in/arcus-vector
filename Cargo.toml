@@ -52,3 +52,6 @@ todo = "warn"
 unimplemented = "warn"
 use_self = "warn"
 or_fun_call = "warn"
+
+[build-dependencies]
+bindgen = "0.73.2"
