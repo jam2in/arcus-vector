@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
 #
-# CodeRabbit review settings for arcus-vector: vector search loaded into ARCUS memcached as an
+# CodeRabbit review settings for arcus-vector: vector search loaded into arcus-memcached as an
 # ASCII protocol extension (`-X`). The module runs inside the daemon, so the review rules below
 # are about keeping the daemon alive and the engine's memory sound.
 
@@ -18,18 +18,14 @@ reviews:
   collapse_walkthrough: false
   poem: false
 
-  # The default branch (master) is always reviewed; no other base branch needs listing.
+  # PRs target develop; the default branch (master) is reviewed without listing it.
   auto_review:
     enabled: true
     drafts: false
+    base_branches:
+      - "develop"
 
-  # Generated or vendored files: reviewing them line by line says nothing about this project.
   path_filters:
-    - "!bindings/engine_api.rs"
-    - "!bindings/headers.fingerprint"
-    - "!include/memcached/**"
-    - "!config.h"
-    - "!config_static.h"
     - "!Cargo.lock"
 
   path_instructions:
@@ -52,16 +48,18 @@ reviews:
         This crate is a cdylib that memcached loads into its own process. A panic or abort here
         takes the whole daemon down, so review for these rules:
         - Never abort on memory shortage. On request and callback paths, allocation must be
-          fallible (`crate::fallible`, `try_reserve`) and failure must become `SERVER_ERROR`.
+          fallible (`try_reserve` and similar) and failure must become `SERVER_ERROR`.
           Flag `Vec::push`/`collect`/`format!`/`to_owned`/`Box::new` on those paths unless the
           size is small and fixed.
         - No `unwrap`/`expect`/`panic!` outside tests.
         - Every `unsafe` block carries a `// SAFETY:` comment that states why it is sound at that
           site, and every `unsafe fn` documents its contract under `# Safety`. Check that the
           comment matches what the code actually relies on.
-        - Log through `crate::host::log` (`log_warn!`, `log_info!`, `log_debug!`, `log_detail!`),
+        - Log through the server's logger (`log_warn!`, `log_info!`, `log_debug!`, `log_detail!`),
           never `eprintln!`/`println!`. Building a log line must not allocate.
-        - Lint exceptions use `#[expect(lint, reason = "...")]`, not `#[allow]`.
+        - Lint exceptions use `#[expect(lint, reason = "...")]`, not `#[allow]`. Generated
+          bindings (`src/memcached/ffi.rs`) are the exception: which lints fire there depends on
+          the headers.
         - Element addresses are raw engine pointers. One reference per element of an event Map is
           ours; it must be released exactly once, and only after no search can still dereference
           it (retire barrier, or the index is halted).
@@ -78,26 +76,40 @@ reviews:
           releases the element later.
         - Graph work for one vkey is queued to the lane its hash selects, and must stay in event
           order.
-    - path: "src/host/**/*.rs"
+    - path: "src/memcached/**/*.rs"
       instructions: |
         Wrappers over the memcached core API and the engine vtable, called by offset through
-        bindgen bindings. Check that pointers passed to C are valid for the duration the C side
-        uses them, and that the vendored headers (not a cargo feature) decide the vtable layout.
+        bindgen bindings (`ffi`). The vtable layout comes from the server's `config.h`, not from a
+        cargo feature. Check that pointers passed to C are valid for the duration the C side uses
+        them.
     - path: "tests/**/*.rs"
       instructions: |
-        Integration tests start a real arcus server (`ARCVECTOR_MEMCACHED`, `ARCVECTOR_ENGINE`)
-        and drive it over a unix socket. Each test owns its server; tests must not depend on order
-        or shared state.
+        Integration tests start a real arcus server and drive it over a socket. Each test owns its
+        server; tests must not depend on order or shared state.
     - path: "build.rs"
       instructions: |
-        The bindings are committed and only regenerated with `--features regen-bindings`. The
-        build must refuse headers that no longer match the recorded fingerprint rather than
-        silently retranslating them.
+        Generates `engine_api.rs` in `OUT_DIR` with bindgen on every build, from `config.h`,
+        `config_static.h` and `include/memcached/*.h` copied to the crate root from a configured
+        arcus-memcached tree. These headers and the generated file are never committed. Check:
+        - `-include config.h` stays, so the server's `ENABLE_*` flags decide the vtable layout.
+        - Layout tests stay on: a member shifted by a header change must fail the build.
+        - Missing headers fail with a message that says what to copy; errors are returned, not
+          unwrapped.
     - path: "Cargo.toml"
       instructions: |
         Lints live in `[lints]`; weakening one needs a stated reason. A new dependency runs inside
         the daemon: check that it does not abort on allocation failure on our call paths, spawn
         threads before memcached daemonizes, or install global handlers (panic hooks, signals).
+        Build dependencies (bindgen) do not run in the daemon.
+    - path: ".github/workflows/**"
+      instructions: |
+        The `test` job reads the private arcus-memcached-EE repository with a GitHub App token.
+        Check:
+        - The token is created and used only in the steps that fetch EE, never in job-level `env`,
+          and never printed, uploaded, or passed to other actions or build scripts.
+        - The job stays behind the `ee` environment (approval) and is skipped for fork PRs.
+        - `actions/checkout` in that job keeps `persist-credentials: false`.
+        - Only first-party actions (`actions/*`) are used.
 
   tools:
     clippy:
