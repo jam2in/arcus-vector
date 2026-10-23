@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: master
+  pull_request:
+    branches: develop
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    environment: ee
+    env:
+      EE_PREFIX: /home/runner/arcus-ee
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/create-github-app-token@v3
+        id: app
+        with:
+          client-id: ${{ secrets.EE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.EE_APP_KEY }}
+          owner: jam2in
+          repositories: arcus-memcached-EE
+
+      - name: Resolve EE revision
+        id: ee
+        env:
+          EE_URL: https://x-access-token:${{ steps.app.outputs.token }}@github.com/jam2in/arcus-memcached-EE.git
+        run: echo "sha=$(git ls-remote "$EE_URL" refs/heads/memc_repl_dev | cut -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache EE build
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.EE_PREFIX }}
+          key: arcus-ee-${{ steps.ee.outputs.sha }}
+
+      - name: Fetch EE
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          EE_URL: https://x-access-token:${{ steps.app.outputs.token }}@github.com/jam2in/arcus-memcached-EE.git
+        run: |
+          git init -q ee && cd ee
+          git fetch -q --depth 1 "$EE_URL" ${{ steps.ee.outputs.sha }}
+          git checkout -q FETCH_HEAD
+
+      - name: Build EE
+        if: steps.cache.outputs.cache-hit != 'true'
+        working-directory: ee
+        run: |
+          ./deps/install.sh "$EE_PREFIX"
+          ./config/autorun.sh
+          ./configure --prefix="$EE_PREFIX" --enable-zk-integration --enable-replication \
+            --with-libevent="$EE_PREFIX" --with-zookeeper="$EE_PREFIX"
+          make -j"$(nproc)" install
+          cp config.h config_static.h "$EE_PREFIX/"
+
+      - name: Copy EE headers
+        run: |
+          cp "$EE_PREFIX/config.h" "$EE_PREFIX/config_static.h" .
+          mkdir -p include/memcached
+          cp "$EE_PREFIX"/include/arcus-memcached/*.h include/memcached/
+
+      - run: cargo build
+      - run: cargo test
