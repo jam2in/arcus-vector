@@ -5,12 +5,15 @@ on:
     branches: master
   pull_request:
     branches: develop
+  pull_request_target:
+    branches: develop
 
 permissions:
   contents: read
 
 jobs:
   lint:
+    if: github.event_name != 'pull_request_target'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,7 +22,10 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
 
   test:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository)
     runs-on: ubuntu-latest
     environment: ee
     env:
@@ -27,6 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || '' }}
           persist-credentials: false
 
       - uses: actions/create-github-app-token@v3
