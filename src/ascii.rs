@@ -4,6 +4,7 @@ use std::ptr;
 
 use crate::guard;
 use crate::memcached::ffi::{AUTHZ_NONE, EXTENSION_ASCII_PROTOCOL_DESCRIPTOR, token_t};
+use crate::protocol::{self, Tokens};
 
 const COMMAND: &[u8] = b"vop";
 const NOT_SUPPORTED: &[u8] = b"NOT_SUPPORTED\r\n";
@@ -73,12 +74,12 @@ unsafe extern "C" fn accept(
 
 /// # Safety
 ///
-/// `response_handler`, if present, must accept `cookie` and bytes that live for the call.
+/// `argv`/`argc` must meet [`Tokens::new`]'s contract; `response_handler` must accept `cookie`.
 unsafe extern "C" fn execute(
     _cmd_cookie: *const c_void,
     cookie: *const c_void,
-    _argc: c_int,
-    _argv: *mut token_t,
+    argc: c_int,
+    argv: *mut token_t,
     response_handler: ResponseHandler,
 ) -> bool {
     guard(
@@ -90,14 +91,16 @@ unsafe extern "C" fn execute(
             let Some(respond) = response_handler else {
                 return false;
             };
-            // SAFETY: `respond` accepts `cookie`, and `NOT_SUPPORTED` is `'static`.
-            unsafe {
-                respond(
-                    cookie,
-                    NOT_SUPPORTED.len() as c_int,
-                    NOT_SUPPORTED.as_ptr().cast(),
-                )
-            }
+            // SAFETY: the caller guarantees `Tokens::new`'s contract.
+            let tokens = unsafe { Tokens::new(argv, argc) };
+            let reply: [&[u8]; 3] = match protocol::parse(&tokens) {
+                Ok(_) => [NOT_SUPPORTED, b"", b""],
+                Err(protocol::Error(reason)) => [b"CLIENT_ERROR ", reason.as_bytes(), b"\r\n"],
+            };
+            reply.iter().filter(|part| !part.is_empty()).all(|part| {
+                // SAFETY: `respond` accepts `cookie`, and every part is `'static`.
+                unsafe { respond(cookie, part.len() as c_int, part.as_ptr().cast()) }
+            })
         },
     )
 }
@@ -180,21 +183,38 @@ mod tests {
         true
     }
 
-    #[test]
-    fn every_vop_line_is_not_supported() {
+    fn reply_to(line: &str) -> String {
         let mut reply: Vec<u8> = Vec::new();
-        let mut tokens = vec![token("vop"), token("create")];
-        // SAFETY: `record` gets the unshared `reply` back as its cookie.
+        let (_buf, mut tokens) = protocol::tokenize(line);
+        // SAFETY: `tokens` point into `_buf`, and `record` gets the unshared `reply` back.
         let ok = unsafe {
             execute(
                 ptr::null(),
                 (&raw mut reply).cast(),
-                2,
+                tokens.len() as c_int,
                 tokens.as_mut_ptr(),
                 Some(record),
             )
         };
         assert!(ok);
-        assert_eq!(reply, b"NOT_SUPPORTED\r\n");
+        String::from_utf8(reply).unwrap()
+    }
+
+    #[test]
+    fn well_formed_lines_are_not_supported_yet() {
+        assert_eq!(reply_to("vop create idx 2 0"), "NOT_SUPPORTED\r\n");
+        assert_eq!(reply_to("vop drop idx"), "NOT_SUPPORTED\r\n");
+    }
+
+    #[test]
+    fn malformed_lines_get_the_reason() {
+        assert_eq!(
+            reply_to("vop create idx"),
+            "CLIENT_ERROR bad command line format\r\n"
+        );
+        assert_eq!(
+            reply_to("vop list"),
+            "CLIENT_ERROR bad command line format\r\n"
+        );
     }
 }

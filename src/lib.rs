@@ -2,6 +2,7 @@
 
 mod ascii;
 mod memcached;
+mod protocol;
 
 use std::os::raw::c_char;
 use std::panic::{AssertUnwindSafe, catch_unwind};
