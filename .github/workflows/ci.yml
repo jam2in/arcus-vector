@@ -10,25 +10,14 @@ permissions:
   contents: read
 
 jobs:
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup component add clippy
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-
-  test:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+  prepare:
+    name: Build arcus-memcached
+    if: github.event_name == 'push' || !github.event.pull_request.head.repo.fork
     runs-on: ubuntu-latest
     environment: ee
     env:
-      EE_PREFIX: /home/runner/arcus-ee
+      PREFIX: /home/runner/arcus-memcached
     steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
       - uses: actions/create-github-app-token@v3
         id: app
         with:
@@ -37,44 +26,69 @@ jobs:
           owner: jam2in
           repositories: arcus-memcached-EE
 
-      - name: Resolve EE revision
-        id: ee
+      - name: Resolve revision
+        id: rev
         env:
-          EE_URL: https://x-access-token:${{ steps.app.outputs.token }}@github.com/jam2in/arcus-memcached-EE.git
-        run: echo "sha=$(git ls-remote "$EE_URL" refs/heads/memc_repl_dev | cut -f1)" >> "$GITHUB_OUTPUT"
+          REPO_URL: https://x-access-token:${{ steps.app.outputs.token }}@github.com/jam2in/arcus-memcached-EE.git
+        run: echo "sha=$(git ls-remote "$REPO_URL" refs/heads/memc_repl_dev | cut -f1)" >> "$GITHUB_OUTPUT"
 
-      - name: Cache EE build
+      - name: Restore build
         id: cache
         uses: actions/cache@v4
         with:
-          path: ${{ env.EE_PREFIX }}
-          key: arcus-ee-${{ steps.ee.outputs.sha }}
+          path: ${{ env.PREFIX }}
+          key: arcus-memcached-${{ steps.rev.outputs.sha }}
 
-      - name: Fetch EE
+      - name: Fetch source
         if: steps.cache.outputs.cache-hit != 'true'
         env:
-          EE_URL: https://x-access-token:${{ steps.app.outputs.token }}@github.com/jam2in/arcus-memcached-EE.git
+          REPO_URL: https://x-access-token:${{ steps.app.outputs.token }}@github.com/jam2in/arcus-memcached-EE.git
         run: |
-          git init -q ee && cd ee
-          git fetch -q --depth 1 "$EE_URL" ${{ steps.ee.outputs.sha }}
+          git init -q src && cd src
+          git fetch -q --depth 1 "$REPO_URL" ${{ steps.rev.outputs.sha }}
           git checkout -q FETCH_HEAD
 
-      - name: Build EE
+      - name: Build
         if: steps.cache.outputs.cache-hit != 'true'
-        working-directory: ee
+        working-directory: src
         run: |
-          ./deps/install.sh "$EE_PREFIX"
+          ./deps/install.sh "$PREFIX"
           ./config/autorun.sh
-          ./configure --prefix="$EE_PREFIX" --enable-zk-integration --enable-replication \
-            --with-libevent="$EE_PREFIX" --with-zookeeper="$EE_PREFIX"
+          ./configure --prefix="$PREFIX" --enable-zk-integration --enable-replication \
+            --with-libevent="$PREFIX" --with-zookeeper="$PREFIX"
           make -j"$(nproc)" install
-          cp config.h config_static.h "$EE_PREFIX/"
+          cp config.h config_static.h "$PREFIX/"
 
-      - name: Copy EE headers
+      - name: Collect headers
         run: |
-          cp "$EE_PREFIX/config.h" "$EE_PREFIX/config_static.h" .
-          mkdir -p include/memcached
-          cp "$EE_PREFIX"/include/arcus-memcached/*.h include/memcached/
+          mkdir -p headers/include/memcached
+          cp "$PREFIX/config.h" "$PREFIX/config_static.h" headers/
+          cp "$PREFIX"/include/arcus-memcached/*.h headers/include/memcached/
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: memcached-headers
+          path: headers/
+
+  lint:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: memcached-headers
+      - run: rustup component add clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: memcached-headers
       - run: cargo build
       - run: cargo test
