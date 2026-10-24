@@ -17,6 +17,8 @@ jobs:
     environment: ee
     env:
       PREFIX: /home/runner/arcus-memcached
+    outputs:
+      cache-key: arcus-memcached-${{ steps.rev.outputs.sha }}
     steps:
       - uses: actions/create-github-app-token@v3
         id: app
@@ -29,8 +31,11 @@ jobs:
       - name: Resolve revision
         id: rev
         env:
-          REPO_URL: https://x-access-token:${{ steps.app.outputs.token }}@github.com/jam2in/arcus-memcached-EE.git
-        run: echo "sha=$(git ls-remote "$REPO_URL" refs/heads/memc_repl_dev | cut -f1)" >> "$GITHUB_OUTPUT"
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          sha=$(gh api repos/jam2in/arcus-memcached-EE/commits/memc_repl_dev --jq .sha)
+          test -n "$sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - name: Restore build
         id: cache
@@ -41,12 +46,13 @@ jobs:
 
       - name: Fetch source
         if: steps.cache.outputs.cache-hit != 'true'
-        env:
-          REPO_URL: https://x-access-token:${{ steps.app.outputs.token }}@github.com/jam2in/arcus-memcached-EE.git
-        run: |
-          git init -q src && cd src
-          git fetch -q --depth 1 "$REPO_URL" ${{ steps.rev.outputs.sha }}
-          git checkout -q FETCH_HEAD
+        uses: actions/checkout@v4
+        with:
+          repository: jam2in/arcus-memcached-EE
+          ref: ${{ steps.rev.outputs.sha }}
+          token: ${{ steps.app.outputs.token }}
+          path: src
+          persist-credentials: false
 
       - name: Build
         if: steps.cache.outputs.cache-hit != 'true'
@@ -59,25 +65,27 @@ jobs:
           make -j"$(nproc)" install
           cp config.h config_static.h "$PREFIX/"
 
-      - name: Collect headers
-        run: |
-          mkdir -p headers/include/memcached
-          cp "$PREFIX/config.h" "$PREFIX/config_static.h" headers/
-          cp "$PREFIX"/include/arcus-memcached/*.h headers/include/memcached/
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: memcached-headers
-          path: headers/
-
   lint:
     needs: prepare
     runs-on: ubuntu-latest
+    env:
+      PREFIX: /home/runner/arcus-memcached
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+
+      - name: Restore arcus-memcached
+        uses: actions/cache/restore@v4
         with:
-          name: memcached-headers
+          path: ${{ env.PREFIX }}
+          key: ${{ needs.prepare.outputs.cache-key }}
+          fail-on-cache-miss: true
+
+      - name: Copy headers
+        run: |
+          cp "$PREFIX/config.h" "$PREFIX/config_static.h" .
+          mkdir -p include/memcached
+          cp "$PREFIX"/include/arcus-memcached/*.h include/memcached/
+
       - run: rustup component add clippy
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
@@ -85,10 +93,49 @@ jobs:
   test:
     needs: prepare
     runs-on: ubuntu-latest
+    env:
+      PREFIX: /home/runner/arcus-memcached
+    services:
+      zookeeper:
+        image: zookeeper:3.9.1
+        ports:
+          - 2181:2181
+        options: --health-cmd "zkServer.sh status" --health-interval 2s --health-retries 15
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+
+      - name: Restore arcus-memcached
+        uses: actions/cache/restore@v4
         with:
-          name: memcached-headers
+          path: ${{ env.PREFIX }}
+          key: ${{ needs.prepare.outputs.cache-key }}
+          fail-on-cache-miss: true
+
+      - name: Copy headers
+        run: |
+          cp "$PREFIX/config.h" "$PREFIX/config_static.h" .
+          mkdir -p include/memcached
+          cp "$PREFIX"/include/arcus-memcached/*.h include/memcached/
+
       - run: cargo build
+
+      - name: build-cluster
+        timeout-minutes: 3
+        env:
+          ZK_CONTAINER: ${{ job.services.zookeeper.id }}
+        run: |
+          docker run --rm --network "container:$ZK_CONTAINER" \
+            -e ZK_ENSEMBLE=localhost:2181 -e SERVICE_CODE=test -e IS_REPL=1 \
+            -e CACHENODES=127.0.0.1:11211,127.0.0.1:11212 \
+            jam2in/zkcli:3.5.9
+          for port in 11211 11212; do
+            "$PREFIX/bin/memcached" -E "$PREFIX/lib/default_engine.so" \
+              -X "$GITHUB_WORKSPACE/target/debug/libarcusv.so" \
+              -m 64 -z 127.0.0.1:2181 -d -p "$port"
+            until printf 'ready\r\nquit\r\n' | nc 127.0.0.1 "$port" | grep -q '^READY'; do sleep 1; done
+          done
+
       - run: cargo test
+        env:
+          ARCUS_VECTOR_MASTER: 127.0.0.1:11211
+          ARCUS_VECTOR_SLAVE: 127.0.0.1:11212
