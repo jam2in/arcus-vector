@@ -11,17 +11,11 @@ mod tokens;
 use std::ops::RangeInclusive;
 use std::str::FromStr;
 
+use crate::error::Error;
+
 pub use tokens::Tokens;
 #[cfg(test)]
 pub use tokens::tokenize;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Error(pub &'static str);
-
-impl Error {
-    pub const MALFORMED: Self = Self("bad command line format");
-    pub const TOO_LARGE: Self = Self("too large value");
-}
 
 pub const DEFAULT_M: usize = 16;
 pub const M_RANGE: RangeInclusive<usize> = 2..=1024;
@@ -184,7 +178,7 @@ fn is(word: &str, keyword: &str) -> bool {
 /// Sets an option that may be given only once.
 fn once<T>(slot: &mut Option<T>, value: T) -> Result<(), Error> {
     match slot.replace(value) {
-        Some(_) => Err(Error::MALFORMED),
+        Some(_) => Err(Error::BadCommandLine),
         None => Ok(()),
     }
 }
@@ -193,7 +187,7 @@ fn in_range<T: PartialOrd>(n: T, range: &RangeInclusive<T>) -> Result<T, Error> 
     if range.contains(&n) {
         Ok(n)
     } else {
-        Err(Error::MALFORMED)
+        Err(Error::BadCommandLine)
     }
 }
 
@@ -215,7 +209,7 @@ impl<'a> Args<'_, 'a> {
     }
 
     fn number<T: FromStr>(&mut self) -> Result<T, Error> {
-        self.next()?.parse().map_err(|_| Error::MALFORMED)
+        self.next()?.parse().map_err(|_| Error::BadCommandLine)
     }
 
     /// Reads the next token only if it is a number.
@@ -256,10 +250,10 @@ pub fn parse<'a>(tokens: &Tokens<'a>) -> Result<Request<'a>, Error> {
             index: args.next()?,
         }
     } else {
-        return Err(Error::MALFORMED);
+        return Err(Error::BadCommandLine);
     };
     if !args.is_empty() {
-        return Err(Error::MALFORMED);
+        return Err(Error::BadCommandLine);
     }
     Ok(request)
 }
@@ -278,24 +272,30 @@ fn create<'a>(args: &mut Args<'_, 'a>) -> Result<Create<'a>, Error> {
         let key = args.next()?;
         let value = args.next()?;
         if is(key, "metric") {
-            once(&mut metric, Metric::parse(value).ok_or(Error::MALFORMED)?)?;
+            once(
+                &mut metric,
+                Metric::parse(value).ok_or(Error::BadCommandLine)?,
+            )?;
         } else if is(key, "quant") {
-            once(&mut quant, Quant::parse(value).ok_or(Error::MALFORMED)?)?;
+            once(
+                &mut quant,
+                Quant::parse(value).ok_or(Error::BadCommandLine)?,
+            )?;
         } else if is(key, "M") {
-            once(&mut m, value.parse().map_err(|_| Error::MALFORMED)?)?;
+            once(&mut m, value.parse().map_err(|_| Error::BadCommandLine)?)?;
         } else if is(key, "efc") {
-            once(&mut efc, value.parse().map_err(|_| Error::MALFORMED)?)?;
+            once(&mut efc, value.parse().map_err(|_| Error::BadCommandLine)?)?;
         } else if is(key, "efs") {
-            once(&mut efs, value.parse().map_err(|_| Error::MALFORMED)?)?;
+            once(&mut efs, value.parse().map_err(|_| Error::BadCommandLine)?)?;
         } else {
-            return Err(Error::MALFORMED);
+            return Err(Error::BadCommandLine);
         }
     }
 
     let metric = metric.unwrap_or(Metric::Cos);
     let quant = quant.unwrap_or(Quant::F32);
     if metric.is_bitwise() != (quant == Quant::B1) {
-        return Err(Error::MALFORMED);
+        return Err(Error::BadCommandLine);
     }
     Ok(Create {
         index,
@@ -321,7 +321,10 @@ fn upsert<'a>(args: &mut Args<'_, 'a>) -> Result<Upsert<'a>, Error> {
         if is(word, "meta") {
             once(&mut meta_bytes, args.number()?)?;
         } else {
-            once(&mut format, Format::parse(word).ok_or(Error::MALFORMED)?)?;
+            once(
+                &mut format,
+                Format::parse(word).ok_or(Error::BadCommandLine)?,
+            )?;
         }
     }
     Ok(Upsert {
@@ -345,7 +348,7 @@ fn search<'a>(args: &mut Args<'_, 'a>) -> Result<Search<'a>, Error> {
         let format = Format::default();
         (Source::Vector { bytes, format }, k)
     } else {
-        return Err(Error::MALFORMED);
+        return Err(Error::BadCommandLine);
     };
 
     let (mut filter_bytes, mut with_meta, mut format) = (None, None, None);
@@ -354,15 +357,18 @@ fn search<'a>(args: &mut Args<'_, 'a>) -> Result<Search<'a>, Error> {
         if is(word, "filter") {
             let n = args.number()?;
             if n > MAX_FILTER_BYTES {
-                return Err(Error::TOO_LARGE);
+                return Err(Error::TooLargeValue);
             }
             once(&mut filter_bytes, n)?;
         } else if is(word, "withmeta") {
             once(&mut with_meta, ())?;
         } else if matches!(source, Source::Vector { .. }) {
-            once(&mut format, Format::parse(word).ok_or(Error::MALFORMED)?)?;
+            once(
+                &mut format,
+                Format::parse(word).ok_or(Error::BadCommandLine)?,
+            )?;
         } else {
-            return Err(Error::MALFORMED);
+            return Err(Error::BadCommandLine);
         }
     }
     if let (Source::Vector { format: slot, .. }, Some(format)) = (&mut source, format) {
@@ -437,17 +443,20 @@ mod tests {
     #[test]
     fn create_rejects_bad_values() {
         for (line, error) in [
-            ("vop create idx", Error::MALFORMED),
-            ("vop create idx 0 0", Error::MALFORMED),
-            ("vop create idx 65536 0", Error::MALFORMED),
-            ("vop create idx 2 -1", Error::MALFORMED),
-            ("vop create idx 2 0 0", Error::MALFORMED),
-            ("vop create idx 2 0 metric", Error::MALFORMED),
-            ("vop create idx 2 0 metric foo", Error::MALFORMED),
-            ("vop create idx 2 0 size 3", Error::MALFORMED),
-            ("vop create idx 2 0 metric l2 METRIC cos", Error::MALFORMED),
-            ("vop create idx 2 0 M 1", Error::MALFORMED),
-            ("vop create idx 2 0 quant b1", Error::MALFORMED),
+            ("vop create idx", Error::BadCommandLine),
+            ("vop create idx 0 0", Error::BadCommandLine),
+            ("vop create idx 65536 0", Error::BadCommandLine),
+            ("vop create idx 2 -1", Error::BadCommandLine),
+            ("vop create idx 2 0 0", Error::BadCommandLine),
+            ("vop create idx 2 0 metric", Error::BadCommandLine),
+            ("vop create idx 2 0 metric foo", Error::BadCommandLine),
+            ("vop create idx 2 0 size 3", Error::BadCommandLine),
+            (
+                "vop create idx 2 0 metric l2 METRIC cos",
+                Error::BadCommandLine,
+            ),
+            ("vop create idx 2 0 M 1", Error::BadCommandLine),
+            ("vop create idx 2 0 quant b1", Error::BadCommandLine),
         ] {
             assert_eq!(parse_line(line), Err(error), "{line}");
         }
@@ -469,20 +478,20 @@ mod tests {
         );
         assert_eq!(
             parse_line("vop upsert idx k1 8 meta 1 meta 2"),
-            Err(Error::MALFORMED)
+            Err(Error::BadCommandLine)
         );
         assert_eq!(
             parse_line("vop upsert idx k1 8 withmeta"),
-            Err(Error::MALFORMED)
+            Err(Error::BadCommandLine)
         );
-        assert_eq!(parse_line("vop setmeta idx k1"), Err(Error::MALFORMED));
+        assert_eq!(parse_line("vop setmeta idx k1"), Err(Error::BadCommandLine));
         for line in [
             "vop upsert idx k1 0",
             "vop upsert idx k1 8 meta",
             "vop upsert idx k1 8 bin str",
             "vop upsert idx k1 8 str str",
         ] {
-            assert_eq!(parse_line(line), Err(Error::MALFORMED), "{line}");
+            assert_eq!(parse_line(line), Err(Error::BadCommandLine), "{line}");
         }
     }
 
@@ -498,11 +507,11 @@ mod tests {
         );
         assert_eq!(
             parse_line("vop search idx vkey k1 0"),
-            Err(Error::MALFORMED)
+            Err(Error::BadCommandLine)
         );
         assert_eq!(
             parse_line("vop search idx vector 5 8 filter 4097"),
-            Err(Error::TOO_LARGE)
+            Err(Error::TooLargeValue)
         );
         for line in [
             "vop search idx key k1 5",
@@ -510,7 +519,7 @@ mod tests {
             "vop search idx vkey k1 10 filter",
             "vop search idx vkey k1 10 withmeta withmeta",
         ] {
-            assert_eq!(parse_line(line), Err(Error::MALFORMED), "{line}");
+            assert_eq!(parse_line(line), Err(Error::BadCommandLine), "{line}");
         }
     }
 
@@ -519,8 +528,8 @@ mod tests {
         assert_eq!(parse_line("vop getmeta idx k1").unwrap(), "getmeta idx k1");
         assert_eq!(parse_line("vop delete idx k1").unwrap(), "delete idx k1");
         assert_eq!(parse_line("vop drop idx").unwrap(), "drop idx");
-        assert_eq!(parse_line("vop drop idx extra"), Err(Error::MALFORMED));
-        assert_eq!(parse_line("vop"), Err(Error::MALFORMED));
-        assert_eq!(parse_line("vop list"), Err(Error::MALFORMED));
+        assert_eq!(parse_line("vop drop idx extra"), Err(Error::BadCommandLine));
+        assert_eq!(parse_line("vop"), Err(Error::BadCommandLine));
+        assert_eq!(parse_line("vop list"), Err(Error::BadCommandLine));
     }
 }

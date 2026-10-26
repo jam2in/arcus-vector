@@ -1,6 +1,6 @@
 use std::os::raw::c_int;
 
-use super::Error;
+use crate::error::Error;
 use crate::memcached::ffi::token_t;
 
 #[derive(Clone, Copy)]
@@ -27,13 +27,13 @@ impl<'a> Tokens<'a> {
     }
 
     pub fn text(&self, i: usize) -> Result<&'a str, Error> {
-        let token = self.tokens.get(i).ok_or(Error::MALFORMED)?;
+        let token = self.tokens.get(i).ok_or(Error::BadCommandLine)?;
         if token.value.is_null() || token.length == 0 {
             return Ok("");
         }
         // SAFETY: `value` is non-null, so it points to `length` bytes valid for `'a`.
         let bytes = unsafe { std::slice::from_raw_parts(token.value.cast::<u8>(), token.length) };
-        std::str::from_utf8(bytes).map_err(|_| Error::MALFORMED)
+        std::str::from_utf8(bytes).map_err(|_| Error::BadCommandLine)
     }
 }
 
