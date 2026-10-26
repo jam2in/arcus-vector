@@ -1,5 +1,6 @@
 //! arcus-vector: vector search as an extension to arcus-memcached.
 
+mod aio;
 mod ascii;
 mod error;
 mod memcached;
@@ -36,6 +37,10 @@ fn initialize(get_server_api: GET_SERVER_API) -> EXTENSION_ERROR_CODE {
     // SAFETY: the core's own function; it takes no arguments and returns its static handle.
     let server = unsafe { get_server_api() };
     if server.is_null() {
+        return EXTENSION_ERROR_CODE_EXTENSION_FATAL;
+    }
+    memcached::server::set(server);
+    if !aio::start() {
         return EXTENSION_ERROR_CODE_EXTENSION_FATAL;
     }
     // SAFETY: `server` was null-checked above and points to the core's static handle.
