@@ -2,12 +2,12 @@ use std::cell::Cell;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 
+use crate::error::Error;
 use crate::guard;
 use crate::memcached::ffi::{AUTHZ_NONE, EXTENSION_ASCII_PROTOCOL_DESCRIPTOR, token_t};
 use crate::protocol::{self, Tokens};
 
 const COMMAND: &[u8] = b"vop";
-const NOT_SUPPORTED: &[u8] = b"NOT_SUPPORTED\r\n";
 
 thread_local! {
     /// Lets the `execute` the core calls right after a panicked `accept` close the connection.
@@ -93,14 +93,12 @@ unsafe extern "C" fn execute(
             };
             // SAFETY: the caller guarantees `Tokens::new`'s contract.
             let tokens = unsafe { Tokens::new(argv, argc) };
-            let reply: [&[u8]; 3] = match protocol::parse(&tokens) {
-                Ok(_) => [NOT_SUPPORTED, b"", b""],
-                Err(protocol::Error(reason)) => [b"CLIENT_ERROR ", reason.as_bytes(), b"\r\n"],
+            let reply = match protocol::parse(&tokens) {
+                Ok(_) => Error::NotSupported.reply(),
+                Err(e) => e.reply(),
             };
-            reply.iter().filter(|part| !part.is_empty()).all(|part| {
-                // SAFETY: `respond` accepts `cookie`, and every part is `'static`.
-                unsafe { respond(cookie, part.len() as c_int, part.as_ptr().cast()) }
-            })
+            // SAFETY: `respond` accepts `cookie`, and `reply` is `'static`.
+            unsafe { respond(cookie, reply.len() as c_int, reply.as_ptr().cast()) }
         },
     )
 }

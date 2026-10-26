@@ -1,6 +1,7 @@
 //! arcus-vector: vector search as an extension to arcus-memcached.
 
 mod ascii;
+mod error;
 mod memcached;
 mod protocol;
 
