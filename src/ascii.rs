@@ -2,10 +2,12 @@ use std::cell::Cell;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 
+use crate::aio;
 use crate::error::Error;
 use crate::guard;
 use crate::memcached::ffi::{AUTHZ_NONE, EXTENSION_ASCII_PROTOCOL_DESCRIPTOR, token_t};
-use crate::protocol::{self, Tokens};
+use crate::memcached::server::{self, ResponseHandler};
+use crate::protocol::{self, Request, Tokens};
 
 const COMMAND: &[u8] = b"vop";
 
@@ -13,9 +15,6 @@ thread_local! {
     /// Lets the `execute` the core calls right after a panicked `accept` close the connection.
     static ACCEPT_PANICKED: Cell<bool> = const { Cell::new(false) };
 }
-
-type ResponseHandler =
-    Option<unsafe extern "C" fn(cookie: *const c_void, nbytes: c_int, dta: *const c_char) -> bool>;
 
 pub(crate) static mut DESCRIPTOR: EXTENSION_ASCII_PROTOCOL_DESCRIPTOR =
     EXTENSION_ASCII_PROTOCOL_DESCRIPTOR {
@@ -88,17 +87,19 @@ unsafe extern "C" fn execute(
             if ACCEPT_PANICKED.replace(false) {
                 return false;
             }
-            let Some(respond) = response_handler else {
-                return false;
-            };
             // SAFETY: the caller guarantees `Tokens::new`'s contract.
             let tokens = unsafe { Tokens::new(argv, argc) };
             let reply = match protocol::parse(&tokens) {
+                Ok(Request::Search(_)) => {
+                    let reply = Error::NotSupported.reply();
+                    // SAFETY: `cookie` is the running command's connection; the handler accepts it.
+                    return unsafe { aio::begin(cookie, reply, response_handler) };
+                }
                 Ok(_) => Error::NotSupported.reply(),
                 Err(e) => e.reply(),
             };
-            // SAFETY: `respond` accepts `cookie`, and `reply` is `'static`.
-            unsafe { respond(cookie, reply.len() as c_int, reply.as_ptr().cast()) }
+            // SAFETY: the caller guarantees `response_handler` accepts `cookie`.
+            unsafe { server::respond(response_handler, cookie, reply) }
         },
     )
 }
