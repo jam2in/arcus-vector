@@ -2,18 +2,22 @@ mod pool;
 
 use std::alloc::{Layout, alloc};
 use std::os::raw::c_void;
+use std::ptr;
 
 use crate::error::Error;
 use crate::guard;
 use crate::memcached::server::{self, ResponseHandler};
 use pool::Entry;
+#[cfg(test)]
+pub use pool::start_once;
 pub use pool::{restart_after_fork, start};
 
 /// Reached from both the lane queue and the callback data; `wake` frees it after the lane.
 #[repr(C)]
-struct Job {
+pub struct Job {
     /// The first field, so its address is the job's.
     entry: Entry,
+    /// Null when no connection waits on the job: a replicated or replayed write.
     cookie: *const c_void,
     reply: &'static [u8],
 }
@@ -54,14 +58,33 @@ pub unsafe fn begin(cookie: *const c_void, reply: &'static [u8], handler: Respon
     unsafe { server::waitfor_io_complete(cookie) };
     // SAFETY: `cookie` is the running command's connection, and `wake` frees `job`.
     unsafe { server::on_io_complete(cookie, wake, job.cast()) };
-    // SAFETY: `job` stays alive until `wake`, which runs only after the lane's notify.
-    unsafe { pool::submit(pool::idlest(), &raw const (*job).entry) };
+    // SAFETY: `job` is new and unqueued, and its connection waits on it.
+    unsafe { submit(job) };
     true
 }
 
+/// A job no connection waits on, for a write from replication or persistence replay.
+pub fn background() -> Option<*mut Job> {
+    Job::new(ptr::null(), b"")
+}
+
+/// # Safety
+///
+/// `job` must be unqueued, and a connection it has must wait on it through `on_io_complete`.
+pub unsafe fn submit(job: *mut Job) {
+    // SAFETY: `job` stays alive until `run` or `wake` frees it, both after the lane takes it.
+    unsafe { pool::submit(pool::idlest(), &raw const (*job).entry) };
+}
+
 unsafe fn run(entry: *const Entry) {
+    let job = entry.cast::<Job>().cast_mut();
     // SAFETY: `entry` is the first field of a `#[repr(C)]` `Job`, alive until `wake`.
-    let cookie = unsafe { (*entry.cast::<Job>()).cookie };
+    let cookie = unsafe { (*job).cookie };
+    if cookie.is_null() {
+        // SAFETY: no `wake` comes for a job without a connection, so the lane frees it.
+        drop(unsafe { Box::from_raw(job) });
+        return;
+    }
     // SAFETY: the connection waits for this notify, so the core keeps it alive until then.
     unsafe { server::notify_io_complete(cookie) };
 }

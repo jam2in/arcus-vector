@@ -3,6 +3,7 @@
 mod aio;
 mod ascii;
 mod error;
+mod event;
 mod memcached;
 mod protocol;
 
@@ -41,6 +42,10 @@ fn initialize(get_server_api: GET_SERVER_API) -> EXTENSION_ERROR_CODE {
     }
     memcached::server::set(server);
     if !aio::start() || !aio::restart_after_fork() {
+        return EXTENSION_ERROR_CODE_EXTENSION_FATAL;
+    }
+    // Before the engine starts, so the events of persistence replay are not missed.
+    if !event::install() {
         return EXTENSION_ERROR_CODE_EXTENSION_FATAL;
     }
     // SAFETY: `server` was null-checked above and points to the core's static handle.

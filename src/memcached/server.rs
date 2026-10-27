@@ -2,7 +2,10 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-use super::ffi::{ENGINE_ERROR_CODE_ENGINE_SUCCESS, SERVER_CORE_API, SERVER_HANDLE_V1};
+use super::ffi::{
+    ENGINE_ERROR_CODE_ENGINE_SUCCESS, ENGINE_EVENT_TYPE, ENGINE_EVENT_TYPE_ON_EVENT_ITEM,
+    SERVER_CORE_API, SERVER_HANDLE_V1,
+};
 
 pub type ResponseHandler =
     Option<unsafe extern "C" fn(cookie: *const c_void, nbytes: c_int, dta: *const c_char) -> bool>;
@@ -12,6 +15,13 @@ pub type IoCallback = unsafe extern "C" fn(
     data: *mut c_void,
     handler: ResponseHandler,
 ) -> bool;
+
+pub type EventCallback = unsafe extern "C" fn(
+    cookie: *const c_void,
+    type_: ENGINE_EVENT_TYPE,
+    event_data: *const c_void,
+    cb_data: *const c_void,
+);
 
 static SERVER: AtomicPtr<SERVER_HANDLE_V1> = AtomicPtr::new(ptr::null_mut());
 
@@ -82,4 +92,28 @@ pub unsafe fn on_io_complete(cookie: *const c_void, cb: IoCallback, data: *mut c
         .expect("the core supports on_io_complete");
     // SAFETY: the caller guarantees `cookie` is a live connection and `data` outlives `cb`.
     unsafe { register(cookie, Some(cb), data) };
+}
+
+/// Registers `cb` for the engine's item and element lifecycle events.
+pub fn register_item_event(cb: EventCallback) -> bool {
+    let server = SERVER.load(Ordering::Acquire);
+    if server.is_null() {
+        return false;
+    }
+    // SAFETY: `server` is the core's static handle, set once at initialization.
+    let callback = unsafe { (*server).callback };
+    // SAFETY: a non-null `callback` is the core's static callback table.
+    let Some(register) = unsafe { callback.as_ref() }.and_then(|api| api.register_callback) else {
+        return false;
+    };
+    // SAFETY: `cb` has the `EVENT_CALLBACK` signature; the core takes a null engine and data.
+    unsafe {
+        register(
+            ptr::null_mut(),
+            ENGINE_EVENT_TYPE_ON_EVENT_ITEM,
+            Some(cb),
+            ptr::null(),
+        );
+    }
+    true
 }
