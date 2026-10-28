@@ -11,6 +11,8 @@ mod tokens;
 use std::ops::RangeInclusive;
 use std::str::FromStr;
 
+use usearch::{MetricKind, ScalarKind};
+
 use crate::error::Error;
 
 pub use tokens::Tokens;
@@ -25,59 +27,29 @@ pub const EF_RANGE: RangeInclusive<usize> = 1..=65536;
 pub const MAX_RESULTS: usize = i32::MAX as usize;
 pub const MAX_FILTER_BYTES: usize = 4096;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Metric {
-    Cos,
-    L2,
-    Ip,
-    Hamming,
-    Tanimoto,
+fn parse_metric(word: &str) -> Option<MetricKind> {
+    lookup(
+        word,
+        &[
+            ("cos", MetricKind::Cos),
+            ("l2", MetricKind::L2sq),
+            ("ip", MetricKind::IP),
+            ("hamming", MetricKind::Hamming),
+            ("tanimoto", MetricKind::Tanimoto),
+        ],
+    )
 }
 
-impl Metric {
-    fn parse(s: &str) -> Option<Self> {
-        lookup(
-            s,
-            &[
-                ("cos", Self::Cos),
-                ("cosine", Self::Cos),
-                ("l2", Self::L2),
-                ("l2sq", Self::L2),
-                ("euclidean", Self::L2),
-                ("ip", Self::Ip),
-                ("dot", Self::Ip),
-                ("hamming", Self::Hamming),
-                ("tanimoto", Self::Tanimoto),
-                ("jaccard", Self::Tanimoto),
-            ],
-        )
-    }
-
-    const fn is_bitwise(self) -> bool {
-        matches!(self, Self::Hamming | Self::Tanimoto)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Quant {
-    F32,
-    F16,
-    I8,
-    B1,
-}
-
-impl Quant {
-    fn parse(s: &str) -> Option<Self> {
-        lookup(
-            s,
-            &[
-                ("f32", Self::F32),
-                ("f16", Self::F16),
-                ("i8", Self::I8),
-                ("b1", Self::B1),
-            ],
-        )
-    }
+fn parse_quant(word: &str) -> Option<ScalarKind> {
+    lookup(
+        word,
+        &[
+            ("f32", ScalarKind::F32),
+            ("f16", ScalarKind::F16),
+            ("i8", ScalarKind::I8),
+            ("b1", ScalarKind::B1),
+        ],
+    )
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -100,8 +72,8 @@ pub struct Create<'a> {
     pub dim: u16,
     pub exptime: u32,
     pub maxcount: Option<u32>,
-    pub metric: Metric,
-    pub quant: Quant,
+    pub metric: MetricKind,
+    pub quant: ScalarKind,
     pub m: usize,
     pub efc: usize,
     pub efs: usize,
@@ -274,13 +246,10 @@ fn create<'a>(args: &mut Args<'_, 'a>) -> Result<Create<'a>, Error> {
         if is(key, "metric") {
             once(
                 &mut metric,
-                Metric::parse(value).ok_or(Error::BadCommandLine)?,
+                parse_metric(value).ok_or(Error::BadCommandLine)?,
             )?;
         } else if is(key, "quant") {
-            once(
-                &mut quant,
-                Quant::parse(value).ok_or(Error::BadCommandLine)?,
-            )?;
+            once(&mut quant, parse_quant(value).ok_or(Error::BadCommandLine)?)?;
         } else if is(key, "M") {
             once(&mut m, value.parse().map_err(|_| Error::BadCommandLine)?)?;
         } else if is(key, "efc") {
@@ -292,9 +261,10 @@ fn create<'a>(args: &mut Args<'_, 'a>) -> Result<Create<'a>, Error> {
         }
     }
 
-    let metric = metric.unwrap_or(Metric::Cos);
-    let quant = quant.unwrap_or(Quant::F32);
-    if metric.is_bitwise() != (quant == Quant::B1) {
+    let metric = metric.unwrap_or(MetricKind::Cos);
+    let quant = quant.unwrap_or(ScalarKind::F32);
+    let bitwise = [MetricKind::Hamming, MetricKind::Tanimoto].contains(&metric);
+    if bitwise != (quant == ScalarKind::B1) {
         return Err(Error::BadCommandLine);
     }
     Ok(Create {
@@ -432,7 +402,7 @@ mod tests {
         );
         assert_eq!(
             parse_line("vop create idx 2 60 100 metric l2 quant f16 M 32 efc 200 efs 10").unwrap(),
-            "create idx 2 60 Some(100) L2 F16 32 200 10"
+            "create idx 2 60 Some(100) L2sq F16 32 200 10"
         );
         assert_eq!(
             parse_line("vop CREATE idx 8 0 metric hamming quant b1").unwrap(),
@@ -450,6 +420,11 @@ mod tests {
             ("vop create idx 2 0 0", Error::BadCommandLine),
             ("vop create idx 2 0 metric", Error::BadCommandLine),
             ("vop create idx 2 0 metric foo", Error::BadCommandLine),
+            ("vop create idx 2 0 metric cosine", Error::BadCommandLine),
+            ("vop create idx 2 0 metric l2sq", Error::BadCommandLine),
+            ("vop create idx 2 0 metric euclidean", Error::BadCommandLine),
+            ("vop create idx 2 0 metric dot", Error::BadCommandLine),
+            ("vop create idx 2 0 metric jaccard", Error::BadCommandLine),
             ("vop create idx 2 0 size 3", Error::BadCommandLine),
             (
                 "vop create idx 2 0 metric l2 METRIC cos",
