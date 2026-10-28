@@ -1,8 +1,13 @@
+use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_void};
-use std::ptr;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::OnceLock;
 
-use super::ffi::{ENGINE_ERROR_CODE_ENGINE_SUCCESS, SERVER_CORE_API, SERVER_HANDLE_V1};
+use super::ffi::{
+    AIO_CALLBACK, ENGINE_ERROR_CODE, ENGINE_ERROR_CODE_ENGINE_SUCCESS, ENGINE_EVENT_TYPE,
+    ENGINE_HANDLE, EVENT_CALLBACK, EXTENSION_ASCII_PROTOCOL_DESCRIPTOR,
+    EXTENSION_LOGGER_DESCRIPTOR, SERVER_HANDLE_V1, VERSION, extension_type_t,
+    extension_type_t_EXTENSION_ASCII_PROTOCOL, rel_time_t, time_t,
+};
 
 pub type ResponseHandler =
     Option<unsafe extern "C" fn(cookie: *const c_void, nbytes: c_int, dta: *const c_char) -> bool>;
@@ -13,21 +18,87 @@ pub type IoCallback = unsafe extern "C" fn(
     handler: ResponseHandler,
 ) -> bool;
 
-static SERVER: AtomicPtr<SERVER_HANDLE_V1> = AtomicPtr::new(ptr::null_mut());
+type GetLogger = unsafe extern "C" fn() -> *mut EXTENSION_LOGGER_DESCRIPTOR;
 
-pub fn set(server: *mut SERVER_HANDLE_V1) {
-    SERVER.store(server, Ordering::Release);
+#[expect(dead_code, reason = "the commands that use the rest are not in yet")]
+struct Api {
+    get_logger: GetLogger,
+    waitfor_io_complete: unsafe extern "C" fn(cookie: *const c_void),
+    notify_io_complete: unsafe extern "C" fn(cookie: *const c_void, status: ENGINE_ERROR_CODE),
+    on_io_complete:
+        unsafe extern "C" fn(cookie: *const c_void, cb: AIO_CALLBACK, cb_data: *mut c_void),
+    realtime: unsafe extern "C" fn(exptime: time_t) -> rel_time_t,
+    store_engine_specific: unsafe extern "C" fn(cookie: *const c_void, engine_data: *mut c_void),
+    get_engine_specific: unsafe extern "C" fn(cookie: *const c_void) -> *mut c_void,
+    register_extension:
+        unsafe extern "C" fn(type_: extension_type_t, extension: *mut c_void) -> bool,
+    register_callback: unsafe extern "C" fn(
+        engine: *mut ENGINE_HANDLE,
+        type_: ENGINE_EVENT_TYPE,
+        cb: EVENT_CALLBACK,
+        cb_data: *const c_void,
+    ),
 }
 
-fn core() -> Option<&'static SERVER_CORE_API> {
-    let server = SERVER.load(Ordering::Acquire);
-    if server.is_null() {
-        return None;
+static API: OnceLock<Api> = OnceLock::new();
+
+/// `false` if this server is not the version arcus-vector was built for or lacks what it uses.
+pub fn set(server: &'static SERVER_HANDLE_V1) -> bool {
+    // A second `-X` of this library fails here, before its descriptor is registered twice.
+    Api::new(server).is_some_and(|api| API.set(api).is_ok())
+}
+
+impl Api {
+    fn new(server: &SERVER_HANDLE_V1) -> Option<Self> {
+        // SAFETY: a non-null `core` of the server handle is its static core API.
+        let core = unsafe { server.core.as_ref() }?;
+        if !built_for(core.server_version?) {
+            return None;
+        }
+        // SAFETY: the other non-null tables of the server handle are its static APIs.
+        let (log, extension, callback) = unsafe {
+            (
+                server.log.as_ref()?,
+                server.extension.as_ref()?,
+                server.callback.as_ref()?,
+            )
+        };
+        Some(Self {
+            get_logger: log.get_logger?,
+            waitfor_io_complete: core.waitfor_io_complete?,
+            notify_io_complete: core.notify_io_complete?,
+            on_io_complete: core.on_io_complete?,
+            realtime: core.realtime?,
+            store_engine_specific: core.store_engine_specific?,
+            get_engine_specific: core.get_engine_specific?,
+            register_extension: extension.register_extension?,
+            register_callback: callback.register_callback?,
+        })
     }
-    // SAFETY: `server` is the core's static handle, set once at initialization.
-    let core = unsafe { (*server).core };
-    // SAFETY: a non-null `core` is the core's static API table.
-    unsafe { core.as_ref() }
+}
+
+fn built_for(server_version: unsafe extern "C" fn() -> *const c_char) -> bool {
+    // SAFETY: the server's own function; it returns its static version string.
+    let running = unsafe { server_version() };
+    // SAFETY: a non-null version is the server's static NUL-terminated string.
+    !running.is_null() && unsafe { CStr::from_ptr(running) }.to_bytes_with_nul() == VERSION
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "`set` checks the API at load, before any command"
+)]
+fn api() -> &'static Api {
+    API.get().expect("the API is checked at load")
+}
+
+/// # Safety
+///
+/// `descriptor` must stay valid while registered; the server links it through `next`.
+pub unsafe fn register_ascii(descriptor: *mut EXTENSION_ASCII_PROTOCOL_DESCRIPTOR) -> bool {
+    let kind = extension_type_t_EXTENSION_ASCII_PROTOCOL;
+    // SAFETY: the caller guarantees `descriptor` outlives its registration.
+    unsafe { (api().register_extension)(kind, descriptor.cast()) }
 }
 
 /// A client connection, as the server names it to the extension.
@@ -65,36 +136,63 @@ impl Connection {
     /// # Safety
     ///
     /// The connection must be running `execute`.
-    #[expect(clippy::expect_used, reason = "the core API is to be checked at load")]
     pub unsafe fn wait_for_io(self) {
-        let waitfor = core()
-            .and_then(|core| core.waitfor_io_complete)
-            .expect("the core supports waitfor_io_complete");
         // SAFETY: the caller guarantees the connection is live.
-        unsafe { waitfor(self.cookie) };
+        unsafe { (api().waitfor_io_complete)(self.cookie) };
     }
 
     /// # Safety
     ///
     /// The connection must be waiting from [`Self::wait_for_io`].
-    #[expect(clippy::expect_used, reason = "the core API is to be checked at load")]
     pub unsafe fn notify_io(self) {
-        let notify = core()
-            .and_then(|core| core.notify_io_complete)
-            .expect("the core supports notify_io_complete");
         // SAFETY: the caller guarantees the connection is waiting, so live.
-        unsafe { notify(self.cookie, ENGINE_ERROR_CODE_ENGINE_SUCCESS) };
+        unsafe { (api().notify_io_complete)(self.cookie, ENGINE_ERROR_CODE_ENGINE_SUCCESS) };
     }
 
     /// # Safety
     ///
     /// The connection must be running `execute`, and `data` must live until `cb` runs.
-    #[expect(clippy::expect_used, reason = "the core API is to be checked at load")]
     pub unsafe fn on_io_complete(self, cb: IoCallback, data: *mut c_void) {
-        let register = core()
-            .and_then(|core| core.on_io_complete)
-            .expect("the core supports on_io_complete");
         // SAFETY: the caller guarantees the connection is live and `data` outlives `cb`.
-        unsafe { register(self.cookie, Some(cb), data) };
+        unsafe { (api().on_io_complete)(self.cookie, Some(cb), data) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memcached::ffi::SERVER_CORE_API;
+
+    unsafe extern "C" fn built() -> *const c_char {
+        VERSION.as_ptr().cast()
+    }
+
+    unsafe extern "C" fn other() -> *const c_char {
+        c"0.0.0".as_ptr()
+    }
+
+    fn check(version: Option<unsafe extern "C" fn() -> *const c_char>) -> Option<Api> {
+        // SAFETY: all-zero is a valid handle and API table: null pointers and `None` functions.
+        let (mut server, core) = unsafe {
+            (
+                std::mem::zeroed::<SERVER_HANDLE_V1>(),
+                Box::leak(Box::new(std::mem::zeroed::<SERVER_CORE_API>())),
+            )
+        };
+        core.server_version = version;
+        server.core = core;
+        Api::new(&server)
+    }
+
+    #[test]
+    fn a_server_of_another_version_is_refused() {
+        assert!(check(None).is_none());
+        assert!(check(Some(other)).is_none());
+    }
+
+    #[test]
+    fn the_built_version_is_recognized() {
+        assert!(built_for(built));
+        assert!(!built_for(other));
     }
 }
