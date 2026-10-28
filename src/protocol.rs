@@ -11,6 +11,8 @@ mod tokens;
 use std::ops::RangeInclusive;
 use std::str::FromStr;
 
+use usearch::{MetricKind, ScalarKind};
+
 use crate::error::Error;
 
 pub use tokens::Tokens;
@@ -25,58 +27,24 @@ pub const EF_RANGE: RangeInclusive<usize> = 1..=65536;
 pub const MAX_RESULTS: usize = i32::MAX as usize;
 pub const MAX_FILTER_BYTES: usize = 4096;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Metric {
-    Cos,
-    L2,
-    Ip,
-    Hamming,
-    Tanimoto,
-}
-
-impl Metric {
-    fn parse(s: &str) -> Option<Self> {
-        lookup(
-            s,
-            &[
-                ("cos", Self::Cos),
-                ("cosine", Self::Cos),
-                ("l2", Self::L2),
-                ("l2sq", Self::L2),
-                ("euclidean", Self::L2),
-                ("ip", Self::Ip),
-                ("dot", Self::Ip),
-                ("hamming", Self::Hamming),
-                ("tanimoto", Self::Tanimoto),
-                ("jaccard", Self::Tanimoto),
-            ],
-        )
-    }
-
-    const fn is_bitwise(self) -> bool {
-        matches!(self, Self::Hamming | Self::Tanimoto)
+fn parse_metric(word: &str) -> Option<MetricKind> {
+    match word {
+        "cos" => Some(MetricKind::Cos),
+        "l2" => Some(MetricKind::L2sq),
+        "ip" => Some(MetricKind::IP),
+        "hamming" => Some(MetricKind::Hamming),
+        "tanimoto" => Some(MetricKind::Tanimoto),
+        _ => None,
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Quant {
-    F32,
-    F16,
-    I8,
-    B1,
-}
-
-impl Quant {
-    fn parse(s: &str) -> Option<Self> {
-        lookup(
-            s,
-            &[
-                ("f32", Self::F32),
-                ("f16", Self::F16),
-                ("i8", Self::I8),
-                ("b1", Self::B1),
-            ],
-        )
+fn parse_quant(word: &str) -> Option<ScalarKind> {
+    match word {
+        "f32" => Some(ScalarKind::F32),
+        "f16" => Some(ScalarKind::F16),
+        "i8" => Some(ScalarKind::I8),
+        "b1" => Some(ScalarKind::B1),
+        _ => None,
     }
 }
 
@@ -89,7 +57,11 @@ pub enum Format {
 
 impl Format {
     fn parse(s: &str) -> Option<Self> {
-        lookup(s, &[("bin", Self::Bin), ("str", Self::Str)])
+        match s {
+            "bin" => Some(Self::Bin),
+            "str" => Some(Self::Str),
+            _ => None,
+        }
     }
 }
 
@@ -100,8 +72,8 @@ pub struct Create<'a> {
     pub dim: u16,
     pub exptime: u32,
     pub maxcount: Option<u32>,
-    pub metric: Metric,
-    pub quant: Quant,
+    pub metric: MetricKind,
+    pub quant: ScalarKind,
     pub m: usize,
     pub efc: usize,
     pub efs: usize,
@@ -164,25 +136,6 @@ pub enum Request<'a> {
     },
 }
 
-fn lookup<T: Copy>(word: &str, table: &[(&str, T)]) -> Option<T> {
-    table
-        .iter()
-        .find(|(name, _)| word.eq_ignore_ascii_case(name))
-        .map(|&(_, value)| value)
-}
-
-fn is(word: &str, keyword: &str) -> bool {
-    word.eq_ignore_ascii_case(keyword)
-}
-
-/// Sets an option that may be given only once.
-fn once<T>(slot: &mut Option<T>, value: T) -> Result<(), Error> {
-    match slot.replace(value) {
-        Some(_) => Err(Error::BadCommandLine),
-        None => Ok(()),
-    }
-}
-
 fn in_range<T: PartialOrd>(n: T, range: &RangeInclusive<T>) -> Result<T, Error> {
     if range.contains(&n) {
         Ok(n)
@@ -222,35 +175,27 @@ impl<'a> Args<'_, 'a> {
 
 pub fn parse<'a>(tokens: &Tokens<'a>) -> Result<Request<'a>, Error> {
     let mut args = Args { tokens, at: 1 };
-    let sub = args.next()?;
-    let request = if is(sub, "create") {
-        Request::Create(create(&mut args)?)
-    } else if is(sub, "upsert") {
-        Request::Upsert(upsert(&mut args)?)
-    } else if is(sub, "setmeta") {
-        Request::SetMeta(SetMeta {
+    let request = match args.next()? {
+        "create" => Request::Create(create(&mut args)?),
+        "upsert" => Request::Upsert(upsert(&mut args)?),
+        "setmeta" => Request::SetMeta(SetMeta {
             index: args.next()?,
             vkey: args.next()?,
             meta_bytes: args.number()?,
-        })
-    } else if is(sub, "search") {
-        Request::Search(search(&mut args)?)
-    } else if is(sub, "getmeta") {
-        Request::GetMeta {
+        }),
+        "search" => Request::Search(search(&mut args)?),
+        "getmeta" => Request::GetMeta {
             index: args.next()?,
             vkey: args.next()?,
-        }
-    } else if is(sub, "delete") {
-        Request::Delete {
+        },
+        "delete" => Request::Delete {
             index: args.next()?,
             vkey: args.next()?,
-        }
-    } else if is(sub, "drop") {
-        Request::Drop {
+        },
+        "drop" => Request::Drop {
             index: args.next()?,
-        }
-    } else {
-        return Err(Error::BadCommandLine);
+        },
+        _ => return Err(Error::BadCommandLine),
     };
     if !args.is_empty() {
         return Err(Error::BadCommandLine);
@@ -267,34 +212,23 @@ fn create<'a>(args: &mut Args<'_, 'a>) -> Result<Create<'a>, Error> {
         .map(|n| in_range(n, &(1..=u32::MAX)))
         .transpose()?;
 
-    let (mut metric, mut quant, mut m, mut efc, mut efs) = (None, None, None, None, None);
+    let (mut metric, mut quant) = (MetricKind::Cos, ScalarKind::F32);
+    let (mut m, mut efc, mut efs) = (DEFAULT_M, DEFAULT_EFC, DEFAULT_EFS);
     while !args.is_empty() {
         let key = args.next()?;
         let value = args.next()?;
-        if is(key, "metric") {
-            once(
-                &mut metric,
-                Metric::parse(value).ok_or(Error::BadCommandLine)?,
-            )?;
-        } else if is(key, "quant") {
-            once(
-                &mut quant,
-                Quant::parse(value).ok_or(Error::BadCommandLine)?,
-            )?;
-        } else if is(key, "M") {
-            once(&mut m, value.parse().map_err(|_| Error::BadCommandLine)?)?;
-        } else if is(key, "efc") {
-            once(&mut efc, value.parse().map_err(|_| Error::BadCommandLine)?)?;
-        } else if is(key, "efs") {
-            once(&mut efs, value.parse().map_err(|_| Error::BadCommandLine)?)?;
-        } else {
-            return Err(Error::BadCommandLine);
+        match key {
+            "metric" => metric = parse_metric(value).ok_or(Error::BadCommandLine)?,
+            "quant" => quant = parse_quant(value).ok_or(Error::BadCommandLine)?,
+            "M" => m = value.parse().map_err(|_| Error::BadCommandLine)?,
+            "efc" => efc = value.parse().map_err(|_| Error::BadCommandLine)?,
+            "efs" => efs = value.parse().map_err(|_| Error::BadCommandLine)?,
+            _ => return Err(Error::BadCommandLine),
         }
     }
 
-    let metric = metric.unwrap_or(Metric::Cos);
-    let quant = quant.unwrap_or(Quant::F32);
-    if metric.is_bitwise() != (quant == Quant::B1) {
+    let bitwise = [MetricKind::Hamming, MetricKind::Tanimoto].contains(&metric);
+    if bitwise != (quant == ScalarKind::B1) {
         return Err(Error::BadCommandLine);
     }
     Ok(Create {
@@ -304,9 +238,9 @@ fn create<'a>(args: &mut Args<'_, 'a>) -> Result<Create<'a>, Error> {
         maxcount,
         metric,
         quant,
-        m: in_range(m.unwrap_or(DEFAULT_M), &M_RANGE)?,
-        efc: in_range(efc.unwrap_or(DEFAULT_EFC), &EF_RANGE)?,
-        efs: in_range(efs.unwrap_or(DEFAULT_EFS), &EF_RANGE)?,
+        m: in_range(m, &M_RANGE)?,
+        efc: in_range(efc, &EF_RANGE)?,
+        efs: in_range(efs, &EF_RANGE)?,
     })
 }
 
@@ -318,13 +252,12 @@ fn upsert<'a>(args: &mut Args<'_, 'a>) -> Result<Upsert<'a>, Error> {
     let (mut meta_bytes, mut format) = (None, None);
     while !args.is_empty() {
         let word = args.next()?;
-        if is(word, "meta") {
-            once(&mut meta_bytes, args.number()?)?;
-        } else {
-            once(
-                &mut format,
-                Format::parse(word).ok_or(Error::BadCommandLine)?,
-            )?;
+        match word {
+            "meta" if meta_bytes.is_none() => meta_bytes = Some(args.number()?),
+            _ if format.is_none() => {
+                format = Some(Format::parse(word).ok_or(Error::BadCommandLine)?);
+            }
+            _ => return Err(Error::BadCommandLine),
         }
     }
     Ok(Upsert {
@@ -339,36 +272,36 @@ fn upsert<'a>(args: &mut Args<'_, 'a>) -> Result<Upsert<'a>, Error> {
 fn search<'a>(args: &mut Args<'_, 'a>) -> Result<Search<'a>, Error> {
     let index = args.next()?;
     let from = args.next()?;
-    let (mut source, k) = if is(from, "vkey") {
-        let vkey = args.next()?;
-        (Source::Vkey(vkey), args.number()?)
-    } else if is(from, "vector") {
-        let k = args.number()?;
-        let bytes = in_range(args.number()?, &(1..=usize::MAX))?;
-        let format = Format::default();
-        (Source::Vector { bytes, format }, k)
-    } else {
-        return Err(Error::BadCommandLine);
+    let (mut source, k) = match from {
+        "vkey" => {
+            let vkey = args.next()?;
+            (Source::Vkey(vkey), args.number()?)
+        }
+        "vector" => {
+            let k = args.number()?;
+            let bytes = in_range(args.number()?, &(1..=usize::MAX))?;
+            let format = Format::default();
+            (Source::Vector { bytes, format }, k)
+        }
+        _ => return Err(Error::BadCommandLine),
     };
 
-    let (mut filter_bytes, mut with_meta, mut format) = (None, None, None);
+    let (mut filter_bytes, mut with_meta, mut format) = (None, false, None);
     while !args.is_empty() {
         let word = args.next()?;
-        if is(word, "filter") {
-            let n = args.number()?;
-            if n > MAX_FILTER_BYTES {
-                return Err(Error::TooLargeValue);
+        match word {
+            "filter" if filter_bytes.is_none() => {
+                let n = args.number()?;
+                if n > MAX_FILTER_BYTES {
+                    return Err(Error::TooLargeValue);
+                }
+                filter_bytes = Some(n);
             }
-            once(&mut filter_bytes, n)?;
-        } else if is(word, "withmeta") {
-            once(&mut with_meta, ())?;
-        } else if matches!(source, Source::Vector { .. }) {
-            once(
-                &mut format,
-                Format::parse(word).ok_or(Error::BadCommandLine)?,
-            )?;
-        } else {
-            return Err(Error::BadCommandLine);
+            "withmeta" if !with_meta => with_meta = true,
+            _ if format.is_none() && matches!(source, Source::Vector { .. }) => {
+                format = Some(Format::parse(word).ok_or(Error::BadCommandLine)?);
+            }
+            _ => return Err(Error::BadCommandLine),
         }
     }
     if let (Source::Vector { format: slot, .. }, Some(format)) = (&mut source, format) {
@@ -380,7 +313,7 @@ fn search<'a>(args: &mut Args<'_, 'a>) -> Result<Search<'a>, Error> {
         source,
         k: in_range(k, &(1..=MAX_RESULTS))?,
         filter_bytes,
-        with_meta: with_meta.is_some(),
+        with_meta,
     })
 }
 
@@ -432,11 +365,23 @@ mod tests {
         );
         assert_eq!(
             parse_line("vop create idx 2 60 100 metric l2 quant f16 M 32 efc 200 efs 10").unwrap(),
-            "create idx 2 60 Some(100) L2 F16 32 200 10"
+            "create idx 2 60 Some(100) L2sq F16 32 200 10"
         );
         assert_eq!(
-            parse_line("vop CREATE idx 8 0 metric hamming quant b1").unwrap(),
+            parse_line("vop create idx 2 60 efs 10 M 32 quant f16 efc 200 metric l2").unwrap(),
+            "create idx 2 60 None L2sq F16 32 200 10"
+        );
+        assert_eq!(
+            parse_line("vop create idx 8 0 metric hamming quant b1").unwrap(),
             "create idx 8 0 None Hamming B1 16 128 64"
+        );
+    }
+
+    #[test]
+    fn a_repeated_create_option_takes_the_last() {
+        assert_eq!(
+            parse_line("vop create idx 2 0 metric l2 metric cos efs 1 efs 2").unwrap(),
+            "create idx 2 0 None Cos F32 16 128 2"
         );
     }
 
@@ -450,11 +395,16 @@ mod tests {
             ("vop create idx 2 0 0", Error::BadCommandLine),
             ("vop create idx 2 0 metric", Error::BadCommandLine),
             ("vop create idx 2 0 metric foo", Error::BadCommandLine),
+            ("vop create idx 2 0 metric cosine", Error::BadCommandLine),
+            ("vop create idx 2 0 metric l2sq", Error::BadCommandLine),
+            ("vop create idx 2 0 metric euclidean", Error::BadCommandLine),
+            ("vop create idx 2 0 metric dot", Error::BadCommandLine),
+            ("vop create idx 2 0 metric jaccard", Error::BadCommandLine),
             ("vop create idx 2 0 size 3", Error::BadCommandLine),
-            (
-                "vop create idx 2 0 metric l2 METRIC cos",
-                Error::BadCommandLine,
-            ),
+            ("vop CREATE idx 2 0", Error::BadCommandLine),
+            ("vop create idx 2 0 METRIC l2", Error::BadCommandLine),
+            ("vop create idx 2 0 metric L2", Error::BadCommandLine),
+            ("vop create idx 2 0 m 32", Error::BadCommandLine),
             ("vop create idx 2 0 M 1", Error::BadCommandLine),
             ("vop create idx 2 0 quant b1", Error::BadCommandLine),
         ] {
@@ -469,16 +419,16 @@ mod tests {
             "upsert idx k1 8 Some(5) Str"
         );
         assert_eq!(
+            parse_line("vop upsert idx k1 8 str meta 5").unwrap(),
+            "upsert idx k1 8 Some(5) Str"
+        );
+        assert_eq!(
             parse_line("vop upsert idx k1 8").unwrap(),
             "upsert idx k1 8 None Bin"
         );
         assert_eq!(
             parse_line("vop setmeta idx k1 5").unwrap(),
             "setmeta idx k1 5"
-        );
-        assert_eq!(
-            parse_line("vop upsert idx k1 8 meta 1 meta 2"),
-            Err(Error::BadCommandLine)
         );
         assert_eq!(
             parse_line("vop upsert idx k1 8 withmeta"),
@@ -488,6 +438,7 @@ mod tests {
         for line in [
             "vop upsert idx k1 0",
             "vop upsert idx k1 8 meta",
+            "vop upsert idx k1 8 meta 1 meta 2",
             "vop upsert idx k1 8 bin str",
             "vop upsert idx k1 8 str str",
         ] {
@@ -506,6 +457,18 @@ mod tests {
             "search idx vector 8 Str 5 None false"
         );
         assert_eq!(
+            parse_line("vop search idx vkey k1 10 withmeta filter 12").unwrap(),
+            "search idx vkey k1 10 Some(12) true"
+        );
+        assert_eq!(
+            parse_line("vop search idx vector 5 8 str withmeta filter 3").unwrap(),
+            "search idx vector 8 Str 5 Some(3) true"
+        );
+        assert_eq!(
+            parse_line("vop search idx vector 5 8 filter 3 str withmeta").unwrap(),
+            "search idx vector 8 Str 5 Some(3) true"
+        );
+        assert_eq!(
             parse_line("vop search idx vkey k1 0"),
             Err(Error::BadCommandLine)
         );
@@ -517,7 +480,10 @@ mod tests {
             "vop search idx key k1 5",
             "vop search idx vector 5 0",
             "vop search idx vkey k1 10 filter",
+            "vop search idx vkey k1 10 str",
             "vop search idx vkey k1 10 withmeta withmeta",
+            "vop search idx vkey k1 10 filter 1 filter 2",
+            "vop search idx vector 5 8 bin str",
         ] {
             assert_eq!(parse_line(line), Err(Error::BadCommandLine), "{line}");
         }
