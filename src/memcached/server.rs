@@ -133,8 +133,9 @@ pub struct Connection {
 impl Connection {
     /// # Safety
     ///
-    /// The server must be running `execute` or the io callback for `cookie`, with `handler`, and
-    /// the connection must not outlive that call; only `execute` may wait for io.
+    /// The server must be running `accept`, `execute`, `abort` or the io callback for `cookie`,
+    /// with the `handler` it passed (`None` for `accept` and `abort`), and the connection must not
+    /// outlive that call; only `execute` may wait for io.
     pub const unsafe fn new(cookie: *const c_void, handler: ResponseHandler) -> Self {
         Self { cookie, handler }
     }
@@ -149,6 +150,16 @@ impl Connection {
         // SAFETY: `new`'s caller guaranteed the connection takes a reply through `handler` now;
         // `reply` outlives the call.
         unsafe { handler(self.cookie, len, reply.as_ptr().cast()) }
+    }
+
+    pub fn keep(self, data: *mut c_void) {
+        // SAFETY: `new`'s caller guaranteed the connection is live.
+        unsafe { (api().store_engine_specific)(self.cookie, data) };
+    }
+
+    pub fn kept(self) -> *mut c_void {
+        // SAFETY: `new`'s caller guaranteed the connection is live.
+        unsafe { (api().get_engine_specific)(self.cookie) }
     }
 
     /// Call before handing the work to another thread, so a notify that comes first still counts.
@@ -186,6 +197,7 @@ impl Drop for IoWaiter {
 /// A core API for unit tests, where each cookie is a [`fake::Conn`].
 #[cfg(test)]
 pub mod fake {
+    use std::cell::Cell;
     use std::mem;
     use std::ptr;
     use std::sync::mpsc::Sender;
@@ -284,10 +296,17 @@ pub mod fake {
         0
     }
 
-    unsafe extern "C" fn store_engine_specific(_: *const c_void, _: *mut c_void) {}
+    thread_local! {
+        static KEPT: Cell<*mut c_void> = const { Cell::new(ptr::null_mut()) };
+    }
+
+    /// Keeps one value per thread, whatever the cookie.
+    unsafe extern "C" fn store_engine_specific(_: *const c_void, data: *mut c_void) {
+        KEPT.set(data);
+    }
 
     unsafe extern "C" fn get_engine_specific(_: *const c_void) -> *mut c_void {
-        ptr::null_mut()
+        KEPT.get()
     }
 
     unsafe extern "C" fn register_extension(_: extension_type_t, _: *mut c_void) -> bool {

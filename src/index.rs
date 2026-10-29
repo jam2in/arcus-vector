@@ -23,6 +23,10 @@ pub fn create(spec: &Create<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+pub fn exists(name: &str) -> bool {
+    read().contains_key(name)
+}
+
 fn read() -> RwLockReadGuard<'static, HashMap<String, Index>> {
     INDEXES.read().unwrap_or_else(PoisonError::into_inner)
 }
