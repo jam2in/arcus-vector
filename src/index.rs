@@ -23,6 +23,10 @@ pub fn create(spec: &Create<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+pub fn exists(name: &str) -> bool {
+    read().contains_key(name)
+}
+
 fn read() -> RwLockReadGuard<'static, HashMap<String, Index>> {
     INDEXES.read().unwrap_or_else(PoisonError::into_inner)
 }
@@ -45,16 +49,11 @@ fn options(spec: &Create<'_>) -> IndexOptions {
 
 #[cfg(test)]
 mod tests {
-    use std::os::raw::c_int;
-
     use super::*;
-    use crate::protocol::{self, Request};
+    use crate::protocol::{self, Request, Tokens};
 
     fn create_line(line: &str) -> Result<(), Error> {
-        let (_buf, tokens) = protocol::tokenize(line);
-        // SAFETY: `tokens` point into `_buf`, which outlives the call.
-        let tokens = unsafe { protocol::Tokens::new(tokens.as_ptr(), tokens.len() as c_int) };
-        let Ok(Request::Create(spec)) = protocol::parse(&tokens) else {
+        let Ok(Request::Create(spec)) = protocol::parse(Tokens::from_line(line).words()) else {
             panic!("not a create line: {line}");
         };
         create(&spec)

@@ -26,6 +26,7 @@ pub const DEFAULT_EFS: usize = 64;
 pub const EF_RANGE: RangeInclusive<usize> = 1..=65536;
 pub const MAX_RESULTS: usize = i32::MAX as usize;
 pub const MAX_FILTER_BYTES: usize = 4096;
+pub const MAX_BODY_BYTES: usize = 1 << 20;
 
 fn parse_metric(word: &str) -> Option<MetricKind> {
     match word {
@@ -136,6 +137,33 @@ pub enum Request<'a> {
     },
 }
 
+impl<'a> Request<'a> {
+    pub const fn index(&self) -> &'a str {
+        match self {
+            Self::Create(c) => c.index,
+            Self::Upsert(u) => u.index,
+            Self::SetMeta(s) => s.index,
+            Self::Search(s) => s.index,
+            Self::GetMeta { index, .. } | Self::Delete { index, .. } | Self::Drop { index } => {
+                index
+            }
+        }
+    }
+
+    /// The lengths of the body segments the line declares, in the order they arrive.
+    pub const fn segments(&self) -> [Option<usize>; 2] {
+        match self {
+            Self::Upsert(u) => [u.meta_bytes, Some(u.vector_bytes)],
+            Self::SetMeta(s) => [Some(s.meta_bytes), None],
+            Self::Search(s) => match s.source {
+                Source::Vector { bytes, .. } => [s.filter_bytes, Some(bytes)],
+                Source::Vkey(_) => [s.filter_bytes, None],
+            },
+            _ => [None, None],
+        }
+    }
+}
+
 fn in_range<T: PartialOrd>(n: T, range: &RangeInclusive<T>) -> Result<T, Error> {
     if range.contains(&n) {
         Ok(n)
@@ -144,37 +172,41 @@ fn in_range<T: PartialOrd>(n: T, range: &RangeInclusive<T>) -> Result<T, Error> 
     }
 }
 
-/// Reads the tokens of a line in order.
-struct Args<'t, 'a> {
-    tokens: &'t Tokens<'a>,
+/// Reads the words of a line in order.
+struct Args<'w, 'a> {
+    words: &'w [&'a str],
     at: usize,
 }
 
 impl<'a> Args<'_, 'a> {
     fn is_empty(&self) -> bool {
-        self.at >= self.tokens.len()
+        self.at >= self.words.len()
+    }
+
+    fn peek(&self) -> Option<&'a str> {
+        self.words.get(self.at).copied()
     }
 
     fn next(&mut self) -> Result<&'a str, Error> {
-        let text = self.tokens.text(self.at)?;
+        let word = self.peek().ok_or(Error::BadCommandLine)?;
         self.at += 1;
-        Ok(text)
+        Ok(word)
     }
 
     fn number<T: FromStr>(&mut self) -> Result<T, Error> {
         self.next()?.parse().map_err(|_| Error::BadCommandLine)
     }
 
-    /// Reads the next token only if it is a number.
+    /// Reads the next word only if it is a number.
     fn optional_number<T: FromStr>(&mut self) -> Option<T> {
-        let n = self.tokens.text(self.at).ok()?.parse().ok()?;
+        let n = self.peek()?.parse().ok()?;
         self.at += 1;
         Some(n)
     }
 }
 
-pub fn parse<'a>(tokens: &Tokens<'a>) -> Result<Request<'a>, Error> {
-    let mut args = Args { tokens, at: 1 };
+pub fn parse<'a>(words: &[&'a str]) -> Result<Request<'a>, Error> {
+    let mut args = Args { words, at: 1 };
     let request = match args.next()? {
         "create" => Request::Create(create(&mut args)?),
         "upsert" => Request::Upsert(upsert(&mut args)?),
@@ -319,15 +351,10 @@ fn search<'a>(args: &mut Args<'_, 'a>) -> Result<Search<'a>, Error> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::raw::c_int;
-
     use super::*;
 
     fn parse_line(line: &str) -> Result<String, Error> {
-        let (_buf, raw) = tokenize(line);
-        // SAFETY: `raw` holds tokens into `_buf`, and both outlive the view.
-        let tokens = unsafe { Tokens::new(raw.as_ptr(), raw.len() as c_int) };
-        parse(&tokens).map(|request| describe(&request))
+        parse(Tokens::from_line(line).words()).map(|request| describe(&request))
     }
 
     fn describe(request: &Request<'_>) -> String {

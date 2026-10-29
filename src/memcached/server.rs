@@ -1,5 +1,6 @@
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_void};
+use std::ptr;
 use std::sync::OnceLock;
 
 use super::ffi::{
@@ -8,6 +9,7 @@ use super::ffi::{
     EXTENSION_LOGGER_DESCRIPTOR, SERVER_HANDLE_V1, VERSION, extension_type_t,
     extension_type_t_EXTENSION_ASCII_PROTOCOL, rel_time_t, time_t,
 };
+use crate::nread::Pending;
 
 pub type ResponseHandler =
     Option<unsafe extern "C" fn(cookie: *const c_void, nbytes: c_int, dta: *const c_char) -> bool>;
@@ -133,24 +135,53 @@ pub struct Connection {
 impl Connection {
     /// # Safety
     ///
-    /// `handler`, if present, must accept `cookie`.
+    /// The server must be running `accept`, `execute`, `abort` or the io callback for `cookie`,
+    /// with the `handler` it passed (`None` for `accept` and `abort`), and the connection must not
+    /// outlive that call.
     pub const unsafe fn new(cookie: *const c_void, handler: ResponseHandler) -> Self {
         Self { cookie, handler }
     }
 
-    /// # Safety
-    ///
-    /// The connection must be running `execute` or its io callback.
-    pub unsafe fn respond(self, reply: &[u8]) -> bool {
+    pub fn respond(self, reply: &[u8]) -> bool {
         let Some(handler) = self.handler else {
             return false;
         };
         let Ok(len) = c_int::try_from(reply.len()) else {
             return false;
         };
-        // SAFETY: `new`'s caller guaranteed `handler` accepts the connection, which the caller
-        // guarantees can take a reply now; `reply` outlives the call.
+        // SAFETY: `new`'s caller guaranteed the connection takes a reply through `handler` now;
+        // `reply` outlives the call.
         unsafe { handler(self.cookie, len, reply.as_ptr().cast()) }
+    }
+
+    /// Keeps `pending` on the connection until [`Connection::take_kept`]; gives it back if the
+    /// connection already keeps one.
+    pub fn keep(self, pending: Pending) -> Result<(), Pending> {
+        if !self.kept().is_null() {
+            return Err(pending);
+        }
+        self.store(Box::into_raw(Box::new(pending)).cast());
+        Ok(())
+    }
+
+    pub fn take_kept(self) -> Option<Pending> {
+        let kept = self.kept().cast::<Pending>();
+        if kept.is_null() {
+            return None;
+        }
+        self.store(ptr::null_mut());
+        // SAFETY: only `keep` stores on a connection, a leaked box, taken back once here.
+        Some(*unsafe { Box::from_raw(kept) })
+    }
+
+    fn store(self, data: *mut c_void) {
+        // SAFETY: `new`'s caller guaranteed the connection is live.
+        unsafe { (api().store_engine_specific)(self.cookie, data) };
+    }
+
+    fn kept(self) -> *mut c_void {
+        // SAFETY: `new`'s caller guaranteed the connection is live.
+        unsafe { (api().get_engine_specific)(self.cookie) }
     }
 
     /// Call before handing the work to another thread, so a notify that comes first still counts.
@@ -191,6 +222,7 @@ impl Drop for IoWaiter {
 /// A core API for unit tests, where each cookie is a [`fake::Conn`].
 #[cfg(test)]
 pub mod fake {
+    use std::cell::Cell;
     use std::mem;
     use std::ptr;
     use std::sync::mpsc::Sender;
@@ -220,7 +252,7 @@ pub mod fake {
         }
 
         pub fn connection(&self) -> Connection {
-            // SAFETY: `record` takes any `Conn` cookie.
+            // SAFETY: `record` takes any `Conn` cookie, which takes a reply or a wait at any time.
             unsafe { Connection::new(ptr::from_ref(self).cast(), Some(record)) }
         }
 
@@ -289,10 +321,17 @@ pub mod fake {
         0
     }
 
-    unsafe extern "C" fn store_engine_specific(_: *const c_void, _: *mut c_void) {}
+    thread_local! {
+        static KEPT: Cell<*mut c_void> = const { Cell::new(ptr::null_mut()) };
+    }
+
+    /// Keeps one value per thread, whatever the cookie.
+    unsafe extern "C" fn store_engine_specific(_: *const c_void, data: *mut c_void) {
+        KEPT.set(data);
+    }
 
     unsafe extern "C" fn get_engine_specific(_: *const c_void) -> *mut c_void {
-        ptr::null_mut()
+        KEPT.get()
     }
 
     unsafe extern "C" fn register_extension(_: extension_type_t, _: *mut c_void) -> bool {

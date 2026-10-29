@@ -2,9 +2,11 @@
 
 mod aio;
 mod ascii;
+mod cmd;
 mod error;
 mod index;
 mod memcached;
+mod nread;
 mod protocol;
 
 use std::os::raw::c_char;
