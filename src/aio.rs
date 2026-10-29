@@ -34,8 +34,8 @@ unsafe extern "C" fn wake(
         || {
             // SAFETY: `data` is the job from `begin`; the core calls this once, after the lane.
             let job = unsafe { Box::from_raw(data.cast::<Job>()) };
-            // SAFETY: the server passes the handler for `cookie`, which is in its io callback.
-            unsafe { Connection::new(cookie, handler).respond(job.reply) }
+            // SAFETY: the server is running the io callback for `cookie`, with `handler`.
+            unsafe { Connection::new(cookie, handler) }.respond(job.reply)
         },
     )
 }
