@@ -53,5 +53,8 @@ unimplemented = "warn"
 use_self = "warn"
 or_fun_call = "warn"
 
+[dependencies]
+usearch = "2.26"
+
 [build-dependencies]
 bindgen = "0.73.2"

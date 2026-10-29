@@ -5,6 +5,7 @@ use std::ptr;
 use crate::aio;
 use crate::error::Error;
 use crate::guard;
+use crate::index;
 use crate::memcached::ffi::{AUTHZ_NONE, EXTENSION_ASCII_PROTOCOL_DESCRIPTOR, token_t};
 use crate::memcached::server::{Connection, ResponseHandler};
 use crate::protocol::{self, Request, Tokens};
@@ -97,6 +98,10 @@ unsafe extern "C" fn execute(
                     // SAFETY: `conn` is running `execute`.
                     return unsafe { aio::begin(conn, reply) };
                 }
+                Ok(Request::Create(spec)) => match index::create(&spec) {
+                    Ok(()) => b"CREATED\r\n",
+                    Err(e) => e.reply(),
+                },
                 Ok(_) => Error::NotSupported.reply(),
                 Err(e) => e.reply(),
             };
@@ -203,8 +208,13 @@ mod tests {
 
     #[test]
     fn well_formed_lines_are_not_supported_yet() {
-        assert_eq!(reply_to("vop create idx 2 0"), "NOT_SUPPORTED\r\n");
         assert_eq!(reply_to("vop drop idx"), "NOT_SUPPORTED\r\n");
+    }
+
+    #[test]
+    fn create_registers_the_index_once() {
+        assert_eq!(reply_to("vop create ascii 2 0"), "CREATED\r\n");
+        assert_eq!(reply_to("vop create ascii 2 0"), "EXISTS\r\n");
     }
 
     #[test]
