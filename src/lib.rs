@@ -2,6 +2,7 @@
 
 mod aio;
 mod ascii;
+mod bson;
 mod cmd;
 mod error;
 mod index;

@@ -55,6 +55,9 @@ or_fun_call = "warn"
 
 [dependencies]
 usearch = "2.26"
+# Metadata keeps its key order through the JSON → BSON → JSON round trip.
+serde_json = { version = "1", features = ["preserve_order"] }
+bson = { version = "3.1", features = ["serde"] }
 
 [build-dependencies]
 bindgen = "0.73.2"
