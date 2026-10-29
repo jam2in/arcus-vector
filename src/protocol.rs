@@ -15,9 +15,9 @@ use usearch::{MetricKind, ScalarKind};
 
 use crate::error::Error;
 
-pub use tokens::Tokens;
 #[cfg(test)]
 pub use tokens::tokenize;
+pub use tokens::{Tokens, split};
 
 pub const DEFAULT_M: usize = 16;
 pub const M_RANGE: RangeInclusive<usize> = 2..=1024;
@@ -26,6 +26,7 @@ pub const DEFAULT_EFS: usize = 64;
 pub const EF_RANGE: RangeInclusive<usize> = 1..=65536;
 pub const MAX_RESULTS: usize = i32::MAX as usize;
 pub const MAX_FILTER_BYTES: usize = 4096;
+pub const MAX_BODY_BYTES: usize = 1 << 20;
 
 fn parse_metric(word: &str) -> Option<MetricKind> {
     lookup(
@@ -134,6 +135,33 @@ pub enum Request<'a> {
     Drop {
         index: &'a str,
     },
+}
+
+impl<'a> Request<'a> {
+    pub const fn index(&self) -> &'a str {
+        match self {
+            Self::Create(c) => c.index,
+            Self::Upsert(u) => u.index,
+            Self::SetMeta(s) => s.index,
+            Self::Search(s) => s.index,
+            Self::GetMeta { index, .. } | Self::Delete { index, .. } | Self::Drop { index } => {
+                index
+            }
+        }
+    }
+
+    /// The lengths of the body segments the line declares, in the order they arrive.
+    pub const fn segments(&self) -> [Option<usize>; 2] {
+        match self {
+            Self::Upsert(u) => [u.meta_bytes, Some(u.vector_bytes)],
+            Self::SetMeta(s) => [Some(s.meta_bytes), None],
+            Self::Search(s) => match s.source {
+                Source::Vector { bytes, .. } => [s.filter_bytes, Some(bytes)],
+                Source::Vkey(_) => [s.filter_bytes, None],
+            },
+            _ => [None, None],
+        }
+    }
 }
 
 fn lookup<T: Copy>(word: &str, table: &[(&str, T)]) -> Option<T> {

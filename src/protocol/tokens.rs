@@ -37,6 +37,23 @@ impl<'a> Tokens<'a> {
     }
 }
 
+/// Splits `line` on spaces into at most `N` tokens that point into it; `None` if there are more.
+pub fn split<const N: usize>(line: &[u8]) -> Option<([token_t; N], usize)> {
+    let mut tokens = [token_t {
+        value: std::ptr::null_mut(),
+        length: 0,
+    }; N];
+    let mut n = 0;
+    for word in line.split(|&b| b == b' ').filter(|w| !w.is_empty()) {
+        *tokens.get_mut(n)? = token_t {
+            value: word.as_ptr().cast_mut().cast(),
+            length: word.len(),
+        };
+        n += 1;
+    }
+    Some((tokens, n))
+}
+
 /// The returned buffer owns the bytes the tokens point into, so it must outlive them.
 #[cfg(test)]
 pub fn tokenize(line: &str) -> (Vec<u8>, Vec<token_t>) {

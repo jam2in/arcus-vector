@@ -131,6 +131,22 @@ impl Connection {
         unsafe { handler(self.cookie, len, reply.as_ptr().cast()) }
     }
 
+    /// # Safety
+    ///
+    /// The connection must be live.
+    pub unsafe fn keep(self, data: *mut c_void) {
+        // SAFETY: the caller guarantees the connection is live.
+        unsafe { (api().store_engine_specific)(self.cookie, data) };
+    }
+
+    /// # Safety
+    ///
+    /// The connection must be live.
+    pub unsafe fn kept(self) -> *mut c_void {
+        // SAFETY: the caller guarantees the connection is live.
+        unsafe { (api().get_engine_specific)(self.cookie) }
+    }
+
     /// Call before handing the work to another thread, so a notify that comes first still counts.
     ///
     /// # Safety
@@ -156,6 +172,53 @@ impl Connection {
         // SAFETY: the caller guarantees the connection is live and `data` outlives `cb`.
         unsafe { (api().on_io_complete)(self.cookie, Some(cb), data) };
     }
+}
+
+/// Sets an API that does nothing but keep one value per thread, for tests without a server.
+#[cfg(test)]
+pub fn fake() {
+    use std::cell::Cell;
+    use std::ptr;
+
+    thread_local! {
+        static KEPT: Cell<*mut c_void> = const { Cell::new(ptr::null_mut()) };
+    }
+    unsafe extern "C" fn get_logger() -> *mut EXTENSION_LOGGER_DESCRIPTOR {
+        ptr::null_mut()
+    }
+    unsafe extern "C" fn waitfor(_: *const c_void) {}
+    unsafe extern "C" fn notify(_: *const c_void, _: ENGINE_ERROR_CODE) {}
+    unsafe extern "C" fn on_io_complete(_: *const c_void, _: AIO_CALLBACK, _: *mut c_void) {}
+    unsafe extern "C" fn realtime(_: time_t) -> rel_time_t {
+        0
+    }
+    unsafe extern "C" fn store(_: *const c_void, data: *mut c_void) {
+        KEPT.set(data);
+    }
+    unsafe extern "C" fn get(_: *const c_void) -> *mut c_void {
+        KEPT.get()
+    }
+    unsafe extern "C" fn register_extension(_: extension_type_t, _: *mut c_void) -> bool {
+        false
+    }
+    unsafe extern "C" fn register_callback(
+        _: *mut ENGINE_HANDLE,
+        _: ENGINE_EVENT_TYPE,
+        _: EVENT_CALLBACK,
+        _: *const c_void,
+    ) {
+    }
+    let _ = API.set(Api {
+        get_logger,
+        waitfor_io_complete: waitfor,
+        notify_io_complete: notify,
+        on_io_complete,
+        realtime,
+        store_engine_specific: store,
+        get_engine_specific: get,
+        register_extension,
+        register_callback,
+    });
 }
 
 #[cfg(test)]
