@@ -29,6 +29,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .clang_arg("-I.")
         .clang_args(["-include", "config.h"])
         .allowlist_file(".*memcached/.*\\.h")
+        .allowlist_var("VERSION")
         .generate()
         .map_err(|e| format!("{}. {COPY_HINT}", e.to_string().trim_end()))?
         .write_to_file(out)?;
