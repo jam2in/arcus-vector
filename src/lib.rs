@@ -12,7 +12,6 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use crate::memcached::ffi::{
     EXTENSION_ERROR_CODE, EXTENSION_ERROR_CODE_EXTENSION_FATAL,
     EXTENSION_ERROR_CODE_EXTENSION_SUCCESS, GET_SERVER_API,
-    extension_type_t_EXTENSION_ASCII_PROTOCOL,
 };
 
 pub(crate) fn guard<T>(on_panic: impl FnOnce() -> T, f: impl FnOnce() -> T) -> T {
@@ -20,51 +19,39 @@ pub(crate) fn guard<T>(on_panic: impl FnOnce() -> T, f: impl FnOnce() -> T) -> T
 }
 
 #[unsafe(no_mangle)]
+#[expect(
+    clippy::print_stderr,
+    reason = "the server's logger is reachable only once its API passes the check"
+)]
 pub extern "C" fn memcached_extensions_initialize(
     _config: *const c_char,
     get_server_api: GET_SERVER_API,
 ) -> EXTENSION_ERROR_CODE {
     guard(
         || EXTENSION_ERROR_CODE_EXTENSION_FATAL,
-        || initialize(get_server_api),
+        || match initialize(get_server_api) {
+            Ok(()) => EXTENSION_ERROR_CODE_EXTENSION_SUCCESS,
+            Err(why) => {
+                eprintln!("arcus-vector: {why}");
+                EXTENSION_ERROR_CODE_EXTENSION_FATAL
+            }
+        },
     )
 }
 
-fn initialize(get_server_api: GET_SERVER_API) -> EXTENSION_ERROR_CODE {
-    let Some(get_server_api) = get_server_api else {
-        return EXTENSION_ERROR_CODE_EXTENSION_FATAL;
-    };
+fn initialize(get_server_api: GET_SERVER_API) -> Result<(), &'static str> {
+    let get_server_api = get_server_api.ok_or("the server passed no get_server_api")?;
     // SAFETY: the core's own function; it takes no arguments and returns its static handle.
-    let server = unsafe { get_server_api() };
-    if server.is_null() {
-        return EXTENSION_ERROR_CODE_EXTENSION_FATAL;
-    }
-    memcached::server::set(server);
+    let server = unsafe { get_server_api().as_ref() }.ok_or("the server has no server API")?;
+    memcached::server::set(server)?;
     if !aio::start() {
-        return EXTENSION_ERROR_CODE_EXTENSION_FATAL;
+        return Err("the lane threads could not start");
     }
-    // SAFETY: `server` was null-checked above and points to the core's static handle.
-    let extension = unsafe { (*server).extension };
-    if extension.is_null() {
-        return EXTENSION_ERROR_CODE_EXTENSION_FATAL;
-    }
-    // SAFETY: `extension` was null-checked above and points to the core's static extension table.
-    let Some(register) = (unsafe { (*extension).register_extension }) else {
-        return EXTENSION_ERROR_CODE_EXTENSION_FATAL;
-    };
-
     // SAFETY: `DESCRIPTOR` is static and only the core touches it from here on (it writes `next`).
-    let registered = unsafe {
-        register(
-            extension_type_t_EXTENSION_ASCII_PROTOCOL,
-            (&raw mut ascii::DESCRIPTOR).cast(),
-        )
-    };
-    if registered {
-        EXTENSION_ERROR_CODE_EXTENSION_SUCCESS
-    } else {
-        EXTENSION_ERROR_CODE_EXTENSION_FATAL
+    if !unsafe { memcached::server::register_ascii(&raw mut ascii::DESCRIPTOR) } {
+        return Err("the server refused the ASCII protocol extension");
     }
+    Ok(())
 }
 
 #[cfg(test)]
