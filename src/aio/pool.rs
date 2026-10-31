@@ -1,27 +1,98 @@
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::os::raw::c_int;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, OnceLock};
 
+use crate::error::Error;
 use crate::memcached::server::IoWaiter;
+use crate::protocol::Request;
 
 const NUM_LANES: usize = 32;
 
-pub enum Task {
-    Notify(IoWaiter),
+/// One command from a connection, which its lane runs and its io callback replies from.
+pub struct Job {
+    op: Op,
+    /// Unset if its lane did not finish it.
+    pub result: OnceLock<Result<Data, Error>>,
 }
 
-impl Task {
-    fn run(self) {
-        match self {
-            Self::Notify(waiter) => drop(waiter),
+impl Job {
+    pub fn new(op: Op) -> Arc<Self> {
+        Arc::new(Self {
+            op,
+            result: OnceLock::new(),
+        })
+    }
+}
+
+/// What a command gives back for its reply; none does yet.
+pub struct Data;
+
+/// A job for a lane, and the connection to wake once it is done.
+struct Task {
+    job: Arc<Job>,
+    waiter: IoWaiter,
+}
+
+pub enum Op {
+    Search,
+    Upsert { index: String, vkey: String },
+    SetMeta { index: String, vkey: String },
+    Delete { index: String, vkey: String },
+}
+
+impl TryFrom<Request<'_>> for Op {
+    type Error = Error;
+
+    fn try_from(request: Request<'_>) -> Result<Self, Error> {
+        match request {
+            Request::Search(_) => Ok(Self::Search),
+            Request::Upsert(u) => Ok(Self::Upsert {
+                index: u.index.into(),
+                vkey: u.vkey.into(),
+            }),
+            Request::SetMeta(m) => Ok(Self::SetMeta {
+                index: m.index.into(),
+                vkey: m.vkey.into(),
+            }),
+            Request::Delete { index, vkey } => Ok(Self::Delete {
+                index: index.into(),
+                vkey: vkey.into(),
+            }),
+            _ => Err(Error::NotSupported),
         }
     }
 }
 
-pub struct Lane {
+impl Op {
+    /// A search goes to the least busy lane; a write goes to its vkey's lane, so that writes on one
+    /// vkey run in the order they came.
+    fn lane(&self) -> &'static Lane {
+        match self {
+            Self::Search => idlest(),
+            Self::Upsert { index, vkey }
+            | Self::SetMeta { index, vkey }
+            | Self::Delete { index, vkey } => lane_of(index, vkey),
+        }
+    }
+}
+
+impl Task {
+    fn run(self) {
+        let result = match self.job.op {
+            Op::Search | Op::Upsert { .. } | Op::SetMeta { .. } | Op::Delete { .. } => {
+                Err(Error::NotSupported)
+            }
+        };
+        let _ = self.job.result.set(result);
+        drop(self.waiter);
+    }
+}
+
+struct Lane {
     tasks: Sender<Task>,
     /// Queued plus running jobs, to pick the least busy lane.
     load: AtomicUsize,
@@ -95,7 +166,7 @@ pub fn start_once() {
     ONCE.call_once(|| assert!(spawn()));
 }
 
-pub fn idlest() -> &'static Lane {
+fn idlest() -> &'static Lane {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
 
     let lanes = lanes();
@@ -116,7 +187,18 @@ pub fn idlest() -> &'static Lane {
     idlest
 }
 
-pub fn submit(lane: &Lane, task: Task) {
+fn lane_of(index: &str, vkey: &str) -> &'static Lane {
+    let mut hasher = DefaultHasher::new();
+    (index, vkey).hash(&mut hasher);
+    &lanes()[(hasher.finish() % NUM_LANES as u64) as usize]
+}
+
+/// Runs `job` on its lane, which leaves how it ended there, then drops `waiter`.
+pub fn submit(job: Arc<Job>, waiter: IoWaiter) {
+    send(job.op.lane(), Task { job, waiter });
+}
+
+fn send(lane: &Lane, task: Task) {
     lane.load.fetch_add(1, Ordering::Relaxed);
     // Fails only if the lane's thread is gone, and a lane never returns.
     let _ = lane.tasks.send(task);
@@ -132,25 +214,36 @@ fn run(lane: &Lane, tasks: &Receiver<Task>) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::time::Duration;
 
     use super::*;
     use crate::memcached::server::fake;
 
     #[test]
-    fn notifies_on_one_lane_come_in_submit_order() {
+    fn ops_on_one_lane_run_in_submit_order() {
         fake::install();
         start_once();
         let (tx, rx) = channel();
         let conns: Vec<_> = (0..100).map(|id| fake::Conn::new(id, &tx)).collect();
         for conn in &conns {
-            // SAFETY: a fake connection takes a wait at any time.
-            let waiter = unsafe { conn.connection().wait_for_io() };
-            submit(&lanes()[3], Task::Notify(waiter));
+            let job = Job::new(Op::Search);
+            let waiter = conn.connection().wait_for_io();
+            send(&lanes()[3], Task { job, waiter });
         }
         let got: Vec<usize> = (0..100)
             .map(|_| rx.recv_timeout(Duration::from_secs(10)).unwrap())
             .collect();
         assert_eq!(got, (0..100).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn one_vkey_always_gets_one_lane() {
+        start_once();
+        assert!(ptr::eq(lane_of("idx", "a"), lane_of("idx", "a")));
+        let spread = (0..1000)
+            .map(|n| ptr::from_ref(lane_of("idx", &format!("v{n}"))))
+            .collect::<HashSet<_>>();
+        assert_eq!(spread.len(), NUM_LANES);
     }
 }

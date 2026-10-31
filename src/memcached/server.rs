@@ -133,42 +133,37 @@ pub struct Connection {
 impl Connection {
     /// # Safety
     ///
-    /// `handler`, if present, must accept `cookie`.
+    /// The server must be running `execute` or the io callback for `cookie`, with `handler`, and
+    /// the connection must not outlive that call; only `execute` may wait for io.
     pub const unsafe fn new(cookie: *const c_void, handler: ResponseHandler) -> Self {
         Self { cookie, handler }
     }
 
-    /// # Safety
-    ///
-    /// The connection must be running `execute` or its io callback.
-    pub unsafe fn respond(self, reply: &[u8]) -> bool {
+    pub fn respond(self, reply: &[u8]) -> bool {
         let Some(handler) = self.handler else {
             return false;
         };
         let Ok(len) = c_int::try_from(reply.len()) else {
             return false;
         };
-        // SAFETY: `new`'s caller guaranteed `handler` accepts the connection, which the caller
-        // guarantees can take a reply now; `reply` outlives the call.
+        // SAFETY: `new`'s caller guaranteed the connection takes a reply through `handler` now;
+        // `reply` outlives the call.
         unsafe { handler(self.cookie, len, reply.as_ptr().cast()) }
     }
 
     /// Call before handing the work to another thread, so a notify that comes first still counts.
-    ///
-    /// # Safety
-    ///
-    /// The connection must be running `execute`.
-    pub unsafe fn wait_for_io(self) -> IoWaiter {
-        // SAFETY: the caller guarantees the connection is live.
+    pub fn wait_for_io(self) -> IoWaiter {
+        // SAFETY: `new`'s caller guaranteed the connection is running `execute`.
         unsafe { (api().waitfor_io_complete)(self.cookie) };
         IoWaiter(self.cookie)
     }
 
     /// # Safety
     ///
-    /// The connection must be running `execute`, and `data` must live until `cb` runs.
+    /// `data` must live until `cb` runs.
     pub unsafe fn on_io_complete(self, cb: IoCallback, data: *mut c_void) {
-        // SAFETY: the caller guarantees the connection is live and `data` outlives `cb`.
+        // SAFETY: `new`'s caller guaranteed the connection is running `execute`; the caller
+        // guarantees `data` outlives `cb`.
         unsafe { (api().on_io_complete)(self.cookie, Some(cb), data) };
     }
 }
@@ -220,7 +215,7 @@ pub mod fake {
         }
 
         pub fn connection(&self) -> Connection {
-            // SAFETY: `record` takes any `Conn` cookie.
+            // SAFETY: `record` takes any `Conn` cookie, which takes a reply or a wait at any time.
             unsafe { Connection::new(ptr::from_ref(self).cast(), Some(record)) }
         }
 

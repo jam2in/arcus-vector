@@ -3,11 +3,10 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 
 use crate::aio;
-use crate::error::Error;
 use crate::guard;
 use crate::memcached::ffi::{AUTHZ_NONE, EXTENSION_ASCII_PROTOCOL_DESCRIPTOR, token_t};
 use crate::memcached::server::{Connection, ResponseHandler};
-use crate::protocol::{self, Request, Tokens};
+use crate::protocol::{self, Tokens};
 
 const COMMAND: &[u8] = b"vop";
 
@@ -89,20 +88,12 @@ unsafe extern "C" fn execute(
             }
             // SAFETY: the caller guarantees `Tokens::new`'s contract.
             let tokens = unsafe { Tokens::new(argv, argc) };
-            // SAFETY: the caller guarantees `response_handler` accepts `cookie`.
+            // SAFETY: the server is running `execute` for `cookie`, with `response_handler`.
             let conn = unsafe { Connection::new(cookie, response_handler) };
-            let reply = match protocol::parse(&tokens) {
-                Ok(Request::Search(_)) => {
-                    let reply = Error::NotSupported.reply();
-                    // SAFETY: `conn` is running `execute`.
-                    unsafe { aio::begin(conn, reply) };
-                    return true;
-                }
-                Ok(_) => Error::NotSupported.reply(),
-                Err(e) => e.reply(),
-            };
-            // SAFETY: `conn` is running `execute`.
-            unsafe { conn.respond(reply) }
+            match protocol::parse(&tokens).and_then(|request| aio::begin(conn, request)) {
+                Ok(()) => true,
+                Err(e) => conn.respond(e.reply()),
+            }
         },
     )
 }
