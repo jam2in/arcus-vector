@@ -111,14 +111,12 @@ unsafe extern "C" fn execute(
                 let Some(pending) = conn.take_kept() else {
                     return false;
                 };
-                // SAFETY: `conn` is running `execute`.
-                return unsafe { cmd::run(conn, pending.request()) };
+                return cmd::run(conn, pending.request());
             }
             // SAFETY: the caller guarantees `Tokens::new`'s contract.
             let request = unsafe { Tokens::new(argv, argc) }
                 .and_then(|tokens| protocol::parse(tokens.words()));
-            // SAFETY: `conn` is running `execute`.
-            unsafe { cmd::run(conn, request) }
+            cmd::run(conn, request)
         },
     )
 }
@@ -301,14 +299,13 @@ mod tests {
 
     #[test]
     fn a_body_is_read_then_answered() {
-        let _ = reply_to("vop create narrow 4 0");
         assert_eq!(
-            reply_to_body("vop setmeta narrow k1 5", b"hello\r\n"),
-            Ok("NOT_SUPPORTED\r\n".into())
+            reply_to_body("vop setmeta absent k1 5", b"hello\r\n"),
+            Ok("NOT_FOUND\r\n".into())
         );
         assert_eq!(
-            reply_to_body("vop upsert narrow k1 4 meta 2", b"{}\r\nabcd\r\n"),
-            Ok("NOT_SUPPORTED\r\n".into())
+            reply_to_body("vop upsert absent k1 4 meta 2", b"{}\r\nabcd\r\n"),
+            Ok("NOT_FOUND\r\n".into())
         );
     }
 

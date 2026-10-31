@@ -208,18 +208,21 @@ impl Connection {
     ///
     /// # Safety
     ///
-    /// The connection must be running `execute`.
+    /// The server must be running `execute` for the connection. It waits only when `execute`
+    /// returns, so a wait from elsewhere leaves the notify to reach a connection that may be gone.
     pub unsafe fn wait_for_io(self) -> IoWaiter {
-        // SAFETY: the caller guarantees the connection is live.
+        // SAFETY: the caller guarantees the connection is running `execute`.
         unsafe { (api().waitfor_io_complete)(self.cookie) };
         IoWaiter(self.cookie)
     }
 
     /// # Safety
     ///
-    /// The connection must be running `execute`, and `data` must live until `cb` runs.
+    /// The server must be running `execute` for the connection, and `data` must live until `cb`
+    /// runs.
     pub unsafe fn on_io_complete(self, cb: IoCallback, data: *mut c_void) {
-        // SAFETY: the caller guarantees the connection is live and `data` outlives `cb`.
+        // SAFETY: the caller guarantees the connection is running `execute` and `data` outlives
+        // `cb`.
         unsafe { (api().on_io_complete)(self.cookie, Some(cb), data) };
     }
 }
