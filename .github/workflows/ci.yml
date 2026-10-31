@@ -13,7 +13,7 @@ jobs:
   prepare:
     name: Build arcus-memcached
     if: github.event_name == 'push' || !github.event.pull_request.head.repo.fork
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: ee
     env:
       PREFIX: /home/runner/arcus-memcached
@@ -67,7 +67,7 @@ jobs:
 
   lint:
     needs: prepare
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       PREFIX: /home/runner/arcus-memcached
     steps:
@@ -92,7 +92,7 @@ jobs:
 
   test:
     needs: prepare
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       PREFIX: /home/runner/arcus-memcached
     services:
