@@ -5,12 +5,14 @@ use std::sync::OnceLock;
 use super::ffi::{
     AIO_CALLBACK, ENGINE_ERROR_CODE, ENGINE_ERROR_CODE_ENGINE_SUCCESS, ENGINE_EVENT_TYPE,
     ENGINE_HANDLE, EVENT_CALLBACK, EXTENSION_ASCII_PROTOCOL_DESCRIPTOR,
-    EXTENSION_LOGGER_DESCRIPTOR, SERVER_HANDLE_V1, VERSION, extension_type_t,
+    EXTENSION_LOGGER_DESCRIPTOR, SERVER_HANDLE_V1, VERSION, engine_interface_v1, extension_type_t,
     extension_type_t_EXTENSION_ASCII_PROTOCOL, rel_time_t, time_t,
 };
 
 pub type ResponseHandler =
     Option<unsafe extern "C" fn(cookie: *const c_void, nbytes: c_int, dta: *const c_char) -> bool>;
+
+pub type GetServerApi = unsafe extern "C" fn() -> *mut SERVER_HANDLE_V1;
 
 pub type IoCallback = unsafe extern "C" fn(
     cookie: *const c_void,
@@ -20,6 +22,7 @@ pub type IoCallback = unsafe extern "C" fn(
 
 #[expect(dead_code, reason = "the commands that use the rest are not in yet")]
 struct Api {
+    get_server_api: GetServerApi,
     get_logger: unsafe extern "C" fn() -> *mut EXTENSION_LOGGER_DESCRIPTOR,
     waitfor_io_complete: unsafe extern "C" fn(cookie: *const c_void),
     notify_io_complete: unsafe extern "C" fn(cookie: *const c_void, status: ENGINE_ERROR_CODE),
@@ -42,13 +45,25 @@ static API: OnceLock<Api> = OnceLock::new();
 
 /// Fails, saying why, if this server is not the version arcus-vector was built for or lacks what
 /// it uses.
-pub fn set(server: &'static SERVER_HANDLE_V1) -> Result<(), &'static str> {
+pub fn set(get_server_api: GetServerApi) -> Result<(), &'static str> {
+    // SAFETY: the server's own function; it takes no arguments and returns its static handle.
+    let server = unsafe { get_server_api().as_ref() }.ok_or("the server has no server API")?;
     // A second `-X` of this library fails here, before its descriptor is registered twice.
-    API.set(Api::new(server)?).map_err(|_| "already loaded")
+    API.set(Api::new(server, get_server_api)?)
+        .map_err(|_| "already loaded")
+}
+
+/// The loaded engine; `None` before the server loads it.
+pub fn engine() -> Option<&'static engine_interface_v1> {
+    // SAFETY: the server's own function; it returns its static handle, whose engine it fills in
+    // only when asked after the engine has loaded.
+    let server = unsafe { (api().get_server_api)().as_ref() }?;
+    // SAFETY: a non-null engine handle is the loaded engine's interface, alive for the process.
+    unsafe { server.engine.cast::<engine_interface_v1>().as_ref() }
 }
 
 impl Api {
-    fn new(server: &SERVER_HANDLE_V1) -> Result<Self, &'static str> {
+    fn new(server: &SERVER_HANDLE_V1, get_server_api: GetServerApi) -> Result<Self, &'static str> {
         // SAFETY: a non-null `core` of the server handle is its static core API.
         let core = unsafe { server.core.as_ref() }.ok_or("the server has no core API")?;
         let server_version = core
@@ -72,6 +87,7 @@ impl Api {
             )
         };
         Ok(Self {
+            get_server_api,
             get_logger: log.get_logger.ok_or("the server lacks get_logger")?,
             waitfor_io_complete: core
                 .waitfor_io_complete
@@ -136,6 +152,10 @@ impl Connection {
     /// `handler`, if present, must accept `cookie`.
     pub const unsafe fn new(cookie: *const c_void, handler: ResponseHandler) -> Self {
         Self { cookie, handler }
+    }
+
+    pub const fn cookie(self) -> *const c_void {
+        self.cookie
     }
 
     /// # Safety
@@ -340,9 +360,16 @@ pub mod fake {
         server
     }
 
+    static SERVER: OnceLock<usize> = OnceLock::new();
+
+    unsafe extern "C" fn get_server_api() -> *mut SERVER_HANDLE_V1 {
+        *SERVER.get_or_init(|| ptr::from_mut(Box::leak(Box::new(server()))) as usize)
+            as *mut SERVER_HANDLE_V1
+    }
+
     pub fn install() {
         static ONCE: Once = Once::new();
-        ONCE.call_once(|| assert_eq!(set(Box::leak(Box::new(server()))), Ok(())));
+        ONCE.call_once(|| assert_eq!(set(get_server_api), Ok(())));
     }
 }
 
@@ -352,13 +379,17 @@ mod tests {
 
     use super::*;
 
+    unsafe extern "C" fn no_server() -> *mut SERVER_HANDLE_V1 {
+        ptr::null_mut()
+    }
+
     unsafe extern "C" fn other() -> *const c_char {
         c"0.0.0".as_ptr()
     }
 
     #[test]
     fn a_server_with_everything_is_taken() {
-        assert!(Api::new(&fake::server()).is_ok());
+        assert!(Api::new(&fake::server(), no_server).is_ok());
     }
 
     #[test]
@@ -367,13 +398,13 @@ mod tests {
         // SAFETY: `core` is the fake's own leaked table, used by nothing else.
         unsafe { (*server.core).server_version = Some(other) };
         assert_eq!(
-            Api::new(&server).err(),
+            Api::new(&server, no_server).err(),
             Some("the server is not the arcus-memcached version arcus-vector was built for")
         );
         // SAFETY: as above.
         unsafe { (*server.core).server_version = None };
         assert_eq!(
-            Api::new(&server).err(),
+            Api::new(&server, no_server).err(),
             Some("the server lacks server_version")
         );
     }
@@ -382,7 +413,10 @@ mod tests {
     fn a_missing_table_is_named() {
         let mut server = fake::server();
         server.log = ptr::null_mut();
-        assert_eq!(Api::new(&server).err(), Some("the server has no log API"));
+        assert_eq!(
+            Api::new(&server, no_server).err(),
+            Some("the server has no log API")
+        );
     }
 
     #[test]
@@ -391,7 +425,7 @@ mod tests {
         // SAFETY: `core` is the fake's own leaked table, used by nothing else.
         unsafe { (*server.core).waitfor_io_complete = None };
         assert_eq!(
-            Api::new(&server).err(),
+            Api::new(&server, no_server).err(),
             Some("the server lacks waitfor_io_complete")
         );
     }
