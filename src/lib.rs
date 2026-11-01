@@ -42,9 +42,7 @@ pub extern "C" fn memcached_extensions_initialize(
 
 fn initialize(get_server_api: GET_SERVER_API) -> Result<(), &'static str> {
     let get_server_api = get_server_api.ok_or("the server passed no get_server_api")?;
-    // SAFETY: the core's own function; it takes no arguments and returns its static handle.
-    let server = unsafe { get_server_api().as_ref() }.ok_or("the server has no server API")?;
-    memcached::server::set(server)?;
+    memcached::server::set(get_server_api)?;
     if !aio::start() {
         return Err("the lane threads could not start");
     }
