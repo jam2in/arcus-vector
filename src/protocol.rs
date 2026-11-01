@@ -13,7 +13,9 @@ use std::str::FromStr;
 
 use usearch::{MetricKind, ScalarKind};
 
+use crate::bson;
 use crate::error::Error;
+use crate::memcached::ffi::MAX_FIELD_LENG;
 
 pub use tokens::Tokens;
 #[cfg(test)]
@@ -24,9 +26,16 @@ pub const M_RANGE: RangeInclusive<usize> = 2..=1024;
 pub const DEFAULT_EFC: usize = 128;
 pub const DEFAULT_EFS: usize = 64;
 pub const EF_RANGE: RangeInclusive<usize> = 1..=65536;
+pub const DEFAULT_MAXCOUNT: u32 = 50_000;
+pub const MAX_MAXCOUNT: u32 = 1_000_000;
 pub const MAX_RESULTS: usize = i32::MAX as usize;
 pub const MAX_FILTER_BYTES: usize = 4096;
 pub const MAX_BODY_BYTES: usize = 1 << 20;
+/// arcus-memcached's `KEY_MAX_LENGTH`, which is in `memcached.h`, not the headers bound here.
+pub const KEY_MAX_LENGTH: usize = 16000;
+/// arcus-memcached's default `max_element_bytes`, set in `memcached.c`: the core refuses a longer
+/// element value, CRLF included, before it reaches the engine.
+pub const MAX_ELEMENT_BYTES: usize = 16 * 1024;
 
 fn parse_metric(word: &str) -> Option<MetricKind> {
     match word {
@@ -72,7 +81,8 @@ pub struct Create<'a> {
     pub index: &'a str,
     pub dim: u16,
     pub exptime: u32,
-    pub maxcount: Option<u32>,
+    /// `DEFAULT_MAXCOUNT` when omitted or 0. The engine caps any count at `max_map_size`.
+    pub maxcount: u32,
     pub metric: MetricKind,
     pub quant: ScalarKind,
     pub m: usize,
@@ -86,7 +96,11 @@ pub struct Upsert<'a> {
     pub index: &'a str,
     pub vkey: &'a str,
     pub vector_bytes: usize,
+    /// The vector the body carries, as its index's `f32`s; empty until the body is read.
+    pub vector: Vec<f32>,
     pub meta_bytes: Option<usize>,
+    /// The metadata the body carries, as BSON; an empty document if it carries none.
+    pub meta: Vec<u8>,
     pub format: Format,
 }
 
@@ -96,6 +110,8 @@ pub struct SetMeta<'a> {
     pub index: &'a str,
     pub vkey: &'a str,
     pub meta_bytes: usize,
+    /// The metadata the body carries, as BSON; empty until the body is read.
+    pub meta: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -105,11 +121,14 @@ pub enum Source<'a> {
 }
 
 /// `vop search <index> vkey <vkey> <num> [filter <f>] [withmeta]`, or
-/// `vop search <index> vector <num> <vector_bytes> [filter <f>] [withmeta] [bin|str]`
+/// `vop search <index> vector <vector_bytes> <num> [filter <f>] [withmeta] [bin|str]`
 #[derive(Debug)]
 pub struct Search<'a> {
     pub index: &'a str,
     pub source: Source<'a>,
+    /// The vector to search by, as its index's `f32`s: from the body for a vector source, empty
+    /// until it is read.
+    pub vector: Vec<f32>,
     pub k: usize,
     pub filter_bytes: Option<usize>,
     pub with_meta: bool,
@@ -150,14 +169,45 @@ impl<'a> Request<'a> {
         }
     }
 
-    /// The lengths of the body segments the line declares, in the order they arrive.
+    /// The format of the vector the body carries, if it carries one.
+    pub const fn vector_format(&self) -> Option<Format> {
+        match self {
+            Self::Upsert(u) => Some(u.format),
+            Self::Search(Search {
+                source: Source::Vector { format, .. },
+                ..
+            }) => Some(*format),
+            _ => None,
+        }
+    }
+
+    /// The metadata of the element the request writes.
+    pub const fn meta(&self) -> Option<&[u8]> {
+        match self {
+            Self::Upsert(u) => Some(u.meta.as_slice()),
+            Self::SetMeta(s) => Some(s.meta.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// Fills in the vector read from the body, for a request that carries one.
+    pub fn set_vector(&mut self, read: Vec<f32>) {
+        match self {
+            Self::Upsert(u) => u.vector = read,
+            Self::Search(s) => s.vector = read,
+            _ => {}
+        }
+    }
+
+    /// The lengths of the body segments the line declares, in the order they arrive: the vector,
+    /// if any, then the metadata or filter.
     pub const fn segments(&self) -> [Option<usize>; 2] {
         match self {
-            Self::Upsert(u) => [u.meta_bytes, Some(u.vector_bytes)],
-            Self::SetMeta(s) => [Some(s.meta_bytes), None],
+            Self::Upsert(u) => [Some(u.vector_bytes), u.meta_bytes],
+            Self::SetMeta(s) => [None, Some(s.meta_bytes)],
             Self::Search(s) => match s.source {
-                Source::Vector { bytes, .. } => [s.filter_bytes, Some(bytes)],
-                Source::Vkey(_) => [s.filter_bytes, None],
+                Source::Vector { bytes, .. } => [Some(bytes), s.filter_bytes],
+                Source::Vkey(_) => [None, s.filter_bytes],
             },
             _ => [None, None],
         }
@@ -193,6 +243,24 @@ impl<'a> Args<'_, 'a> {
         Ok(word)
     }
 
+    /// An index names an item, so it is no longer than a key.
+    fn index(&mut self) -> Result<&'a str, Error> {
+        self.next_within(KEY_MAX_LENGTH)
+    }
+
+    /// A vkey names a field of the index's map.
+    fn vkey(&mut self) -> Result<&'a str, Error> {
+        self.next_within(MAX_FIELD_LENG as usize)
+    }
+
+    fn next_within(&mut self, max: usize) -> Result<&'a str, Error> {
+        let text = self.next()?;
+        if text.len() > max {
+            return Err(Error::BadCommandLine);
+        }
+        Ok(text)
+    }
+
     fn number<T: FromStr>(&mut self) -> Result<T, Error> {
         self.next()?.parse().map_err(|_| Error::BadCommandLine)
     }
@@ -211,21 +279,22 @@ pub fn parse<'a>(words: &[&'a str]) -> Result<Request<'a>, Error> {
         "create" => Request::Create(create(&mut args)?),
         "upsert" => Request::Upsert(upsert(&mut args)?),
         "setmeta" => Request::SetMeta(SetMeta {
-            index: args.next()?,
-            vkey: args.next()?,
+            index: args.index()?,
+            vkey: args.vkey()?,
             meta_bytes: args.number()?,
+            meta: Vec::new(),
         }),
         "search" => Request::Search(search(&mut args)?),
         "getmeta" => Request::GetMeta {
-            index: args.next()?,
-            vkey: args.next()?,
+            index: args.index()?,
+            vkey: args.vkey()?,
         },
         "delete" => Request::Delete {
-            index: args.next()?,
-            vkey: args.next()?,
+            index: args.index()?,
+            vkey: args.vkey()?,
         },
         "drop" => Request::Drop {
-            index: args.next()?,
+            index: args.index()?,
         },
         _ => return Err(Error::BadCommandLine),
     };
@@ -236,13 +305,13 @@ pub fn parse<'a>(words: &[&'a str]) -> Result<Request<'a>, Error> {
 }
 
 fn create<'a>(args: &mut Args<'_, 'a>) -> Result<Create<'a>, Error> {
-    let index = args.next()?;
+    let index = args.index()?;
     let dim = in_range(args.number()?, &(1..=u16::MAX))?;
     let exptime = args.number()?;
-    let maxcount = args
-        .optional_number()
-        .map(|n| in_range(n, &(1..=u32::MAX)))
-        .transpose()?;
+    let maxcount = match args.optional_number() {
+        None | Some(0) => DEFAULT_MAXCOUNT,
+        Some(n) => in_range(n, &(1..=MAX_MAXCOUNT))?,
+    };
 
     let (mut metric, mut quant) = (MetricKind::Cos, ScalarKind::F32);
     let (mut m, mut efc, mut efs) = (DEFAULT_M, DEFAULT_EFC, DEFAULT_EFS);
@@ -277,8 +346,8 @@ fn create<'a>(args: &mut Args<'_, 'a>) -> Result<Create<'a>, Error> {
 }
 
 fn upsert<'a>(args: &mut Args<'_, 'a>) -> Result<Upsert<'a>, Error> {
-    let index = args.next()?;
-    let vkey = args.next()?;
+    let index = args.index()?;
+    let vkey = args.vkey()?;
     let vector_bytes = in_range(args.number()?, &(1..=usize::MAX))?;
 
     let (mut meta_bytes, mut format) = (None, None);
@@ -296,22 +365,24 @@ fn upsert<'a>(args: &mut Args<'_, 'a>) -> Result<Upsert<'a>, Error> {
         index,
         vkey,
         vector_bytes,
+        vector: Vec::new(),
         meta_bytes,
+        meta: bson::EMPTY.to_vec(),
         format: format.unwrap_or_default(),
     })
 }
 
 fn search<'a>(args: &mut Args<'_, 'a>) -> Result<Search<'a>, Error> {
-    let index = args.next()?;
+    let index = args.index()?;
     let from = args.next()?;
     let (mut source, k) = match from {
         "vkey" => {
-            let vkey = args.next()?;
+            let vkey = args.vkey()?;
             (Source::Vkey(vkey), args.number()?)
         }
         "vector" => {
-            let k = args.number()?;
             let bytes = in_range(args.number()?, &(1..=usize::MAX))?;
+            let k = args.number()?;
             let format = Format::default();
             (Source::Vector { bytes, format }, k)
         }
@@ -343,6 +414,7 @@ fn search<'a>(args: &mut Args<'_, 'a>) -> Result<Search<'a>, Error> {
     Ok(Search {
         index,
         source,
+        vector: Vec::new(),
         k: in_range(k, &(1..=MAX_RESULTS))?,
         filter_bytes,
         with_meta,
@@ -360,7 +432,7 @@ mod tests {
     fn describe(request: &Request<'_>) -> String {
         match request {
             Request::Create(c) => format!(
-                "create {} {} {} {:?} {:?} {:?} {} {} {}",
+                "create {} {} {} {} {:?} {:?} {} {} {}",
                 c.index, c.dim, c.exptime, c.maxcount, c.metric, c.quant, c.m, c.efc, c.efs
             ),
             Request::Upsert(u) => format!(
@@ -371,7 +443,7 @@ mod tests {
             Request::Search(s) => {
                 let source = match &s.source {
                     Source::Vkey(vkey) => format!("vkey {vkey}"),
-                    Source::Vector { bytes, format } => format!("vector {bytes} {format:?}"),
+                    Source::Vector { bytes, format, .. } => format!("vector {bytes} {format:?}"),
                 };
                 format!(
                     "search {} {} {} {:?} {}",
@@ -388,19 +460,23 @@ mod tests {
     fn create_takes_defaults_and_options() {
         assert_eq!(
             parse_line("vop create idx 128 0").unwrap(),
-            "create idx 128 0 None Cos F32 16 128 64"
+            "create idx 128 0 50000 Cos F32 16 128 64"
         );
         assert_eq!(
             parse_line("vop create idx 2 60 100 metric l2 quant f16 M 32 efc 200 efs 10").unwrap(),
-            "create idx 2 60 Some(100) L2sq F16 32 200 10"
+            "create idx 2 60 100 L2sq F16 32 200 10"
         );
         assert_eq!(
             parse_line("vop create idx 2 60 efs 10 M 32 quant f16 efc 200 metric l2").unwrap(),
-            "create idx 2 60 None L2sq F16 32 200 10"
+            "create idx 2 60 50000 L2sq F16 32 200 10"
         );
         assert_eq!(
             parse_line("vop create idx 8 0 metric hamming quant b1").unwrap(),
-            "create idx 8 0 None Hamming B1 16 128 64"
+            "create idx 8 0 50000 Hamming B1 16 128 64"
+        );
+        assert_eq!(
+            parse_line("vop create idx 2 0 0").unwrap(),
+            "create idx 2 0 50000 Cos F32 16 128 64"
         );
     }
 
@@ -408,7 +484,7 @@ mod tests {
     fn a_repeated_create_option_takes_the_last() {
         assert_eq!(
             parse_line("vop create idx 2 0 metric l2 metric cos efs 1 efs 2").unwrap(),
-            "create idx 2 0 None Cos F32 16 128 2"
+            "create idx 2 0 50000 Cos F32 16 128 2"
         );
     }
 
@@ -419,7 +495,7 @@ mod tests {
             ("vop create idx 0 0", Error::BadCommandLine),
             ("vop create idx 65536 0", Error::BadCommandLine),
             ("vop create idx 2 -1", Error::BadCommandLine),
-            ("vop create idx 2 0 0", Error::BadCommandLine),
+            ("vop create idx 2 0 1000001", Error::BadCommandLine),
             ("vop create idx 2 0 metric", Error::BadCommandLine),
             ("vop create idx 2 0 metric foo", Error::BadCommandLine),
             ("vop create idx 2 0 metric cosine", Error::BadCommandLine),
@@ -436,6 +512,41 @@ mod tests {
             ("vop create idx 2 0 quant b1", Error::BadCommandLine),
         ] {
             assert_eq!(parse_line(line), Err(error), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_too_long_index_or_vkey_is_refused() {
+        let named = |index: &str, vkey: &str| {
+            [
+                format!("vop upsert {index} {vkey} 8"),
+                format!("vop setmeta {index} {vkey} 5"),
+                format!("vop getmeta {index} {vkey}"),
+                format!("vop delete {index} {vkey}"),
+                format!("vop search {index} vkey {vkey} 5"),
+            ]
+        };
+        let indexed = |index: &str| {
+            [
+                format!("vop create {index} 2 0"),
+                format!("vop drop {index}"),
+                format!("vop search {index} vector 8 5"),
+            ]
+        };
+        let (index, vkey) = (
+            "i".repeat(KEY_MAX_LENGTH),
+            "v".repeat(MAX_FIELD_LENG as usize),
+        );
+        let (long_index, long_vkey) = (format!("{index}i"), format!("{vkey}v"));
+        for line in named(&index, &vkey).into_iter().chain(indexed(&index)) {
+            assert!(parse_line(&line).is_ok(), "{line:.40}");
+        }
+        for line in named(&long_index, &vkey)
+            .into_iter()
+            .chain(named(&index, &long_vkey))
+            .chain(indexed(&long_index))
+        {
+            assert_eq!(parse_line(&line), Err(Error::BadCommandLine), "{line:.40}");
         }
     }
 
@@ -480,7 +591,7 @@ mod tests {
             "search idx vkey k1 10 Some(12) true"
         );
         assert_eq!(
-            parse_line("vop search idx vector 5 8 str").unwrap(),
+            parse_line("vop search idx vector 8 5 str").unwrap(),
             "search idx vector 8 Str 5 None false"
         );
         assert_eq!(
@@ -488,11 +599,11 @@ mod tests {
             "search idx vkey k1 10 Some(12) true"
         );
         assert_eq!(
-            parse_line("vop search idx vector 5 8 str withmeta filter 3").unwrap(),
+            parse_line("vop search idx vector 8 5 str withmeta filter 3").unwrap(),
             "search idx vector 8 Str 5 Some(3) true"
         );
         assert_eq!(
-            parse_line("vop search idx vector 5 8 filter 3 str withmeta").unwrap(),
+            parse_line("vop search idx vector 8 5 filter 3 str withmeta").unwrap(),
             "search idx vector 8 Str 5 Some(3) true"
         );
         assert_eq!(
@@ -500,17 +611,17 @@ mod tests {
             Err(Error::BadCommandLine)
         );
         assert_eq!(
-            parse_line("vop search idx vector 5 8 filter 4097"),
+            parse_line("vop search idx vector 8 5 filter 4097"),
             Err(Error::TooLargeValue)
         );
         for line in [
             "vop search idx key k1 5",
-            "vop search idx vector 5 0",
+            "vop search idx vector 0 5",
             "vop search idx vkey k1 10 filter",
             "vop search idx vkey k1 10 str",
             "vop search idx vkey k1 10 withmeta withmeta",
             "vop search idx vkey k1 10 filter 1 filter 2",
-            "vop search idx vector 5 8 bin str",
+            "vop search idx vector 8 5 bin str",
         ] {
             assert_eq!(parse_line(line), Err(Error::BadCommandLine), "{line}");
         }
