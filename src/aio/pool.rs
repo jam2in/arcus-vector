@@ -9,7 +9,7 @@ use std::sync::{Arc, Barrier, OnceLock};
 
 use crate::error::Error;
 use crate::memcached::server::IoWaiter;
-use crate::protocol::Request;
+use crate::protocol::{Request, Search, Source};
 
 const NUM_LANES: usize = 32;
 
@@ -22,19 +22,26 @@ struct Task {
     _wait: IoWaiter,
 }
 
+#[expect(dead_code, reason = "no op runs yet")]
 pub enum Op {
-    Search,
+    Search { index: String, vector: Vec<f32> },
     Upsert { index: String, vkey: String },
     SetMeta { index: String, vkey: String },
     Delete { index: String, vkey: String },
 }
 
-impl TryFrom<Request<'_>> for Op {
-    type Error = Error;
-
-    fn try_from(request: Request<'_>) -> Result<Self, Error> {
+impl Op {
+    pub fn new(request: Request<'_>) -> Result<Self, Error> {
         match request {
-            Request::Search(_) => Ok(Self::Search),
+            // Waits for the engine to give the vkey's vector.
+            Request::Search(Search {
+                source: Source::Vkey(_),
+                ..
+            }) => Err(Error::NotSupported),
+            Request::Search(Search { index, vector, .. }) => Ok(Self::Search {
+                index: index.into(),
+                vector,
+            }),
             Request::Upsert(u) => Ok(Self::Upsert {
                 index: u.index.into(),
                 vkey: u.vkey.into(),
@@ -50,14 +57,12 @@ impl TryFrom<Request<'_>> for Op {
             _ => Err(Error::NotSupported),
         }
     }
-}
 
-impl Op {
     /// A search goes to the least busy lane; a write goes to its vkey's lane, so that writes on one
     /// vkey run in the order they came.
     fn lane(&self) -> &'static Lane {
         match self {
-            Self::Search => idlest(),
+            Self::Search { .. } => idlest(),
             Self::Upsert { index, vkey }
             | Self::SetMeta { index, vkey }
             | Self::Delete { index, vkey } => lane_of(index, vkey),
@@ -68,7 +73,7 @@ impl Op {
 impl Task {
     fn run(self) {
         let reply = match self.op {
-            Op::Search | Op::Upsert { .. } | Op::SetMeta { .. } | Op::Delete { .. } => {
+            Op::Search { .. } | Op::Upsert { .. } | Op::SetMeta { .. } | Op::Delete { .. } => {
                 Error::NotSupported.reply()
             }
         };
@@ -218,7 +223,11 @@ mod tests {
         let (tx, rx) = channel();
         let conns: Vec<_> = (0..100).map(|id| fake::Conn::new(id, &tx)).collect();
         for conn in &conns {
-            let (op, reply) = (Op::Search, Arc::default());
+            let op = Op::Search {
+                index: "idx".into(),
+                vector: Vec::new(),
+            };
+            let reply = Arc::default();
             // SAFETY: the fake server takes a wait on a `Conn` at any time.
             let waiter = unsafe { conn.connection().wait_for_io() };
             send(

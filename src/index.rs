@@ -23,8 +23,8 @@ pub fn create(spec: &Create<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-pub fn exists(name: &str) -> bool {
-    read().contains_key(name)
+pub fn dimensions(name: &str) -> Option<usize> {
+    read().get(name).map(Index::dimensions)
 }
 
 fn read() -> RwLockReadGuard<'static, HashMap<String, Index>> {
