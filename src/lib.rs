@@ -2,6 +2,7 @@
 
 mod aio;
 mod ascii;
+mod bson;
 mod error;
 mod memcached;
 mod protocol;
