@@ -119,11 +119,13 @@ unsafe extern "C" fn execute(
                 let Some(pending) = (unsafe { nread::take(conn) }) else {
                     return false;
                 };
-                return cmd::run(conn, pending.request());
+                let request = pending.request();
+                let vector = request.as_ref().map_or(&[][..], |r| pending.vector(r));
+                return cmd::run(conn, request, vector);
             }
             // SAFETY: the caller guarantees `Tokens::new`'s contract.
             let tokens = unsafe { Tokens::new(argv, argc) };
-            cmd::run(conn, protocol::parse(&tokens))
+            cmd::run(conn, protocol::parse(&tokens), &[])
         },
     )
 }
@@ -312,6 +314,19 @@ mod tests {
         assert_eq!(
             reply_to_body("vop upsert absent k1 4 meta 2", b"{}\r\nabcd\r\n"),
             Ok("NOT_FOUND\r\n".into())
+        );
+    }
+
+    #[test]
+    fn a_vector_of_other_dimensions_is_a_bad_value() {
+        assert_eq!(reply_to("vop create twodim 2 0"), "CREATED\r\n");
+        assert_eq!(
+            reply_to_body("vop upsert twodim k1 4", b"abcd\r\n"),
+            Ok("CLIENT_ERROR bad value\r\n".into())
+        );
+        assert_eq!(
+            reply_to_body("vop upsert twodim k1 3 meta 2 str", b"{}\r\n1.5\r\n"),
+            Ok("CLIENT_ERROR bad value\r\n".into())
         );
     }
 

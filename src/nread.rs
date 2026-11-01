@@ -54,6 +54,15 @@ impl Pending {
         }
         Ok(request)
     }
+
+    /// The vector `request` declared, without its CRLF; empty if it declared none.
+    pub fn vector(&self, request: &Request<'_>) -> &[u8] {
+        let [first, vector] = request.segments();
+        let start = first.map_or(0, |n| n + 2);
+        vector
+            .and_then(|n| self.body.get(start..start + n))
+            .unwrap_or_default()
+    }
 }
 
 /// Keeps the line on `conn` with a `len`-byte body buffer, which it returns; `None` without memory.

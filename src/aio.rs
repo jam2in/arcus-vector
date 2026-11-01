@@ -9,11 +9,15 @@ use crate::protocol::Request;
 pub use pool::start;
 use pool::{Job, Op};
 
-/// Hands `request` to a lane, to be replied to from the io callback; an error is for `execute` to
-/// reply with.
-pub fn begin(conn: Connection, request: Request<'_>) -> Result<(), Error> {
+/// Hands `request`, with the vector it carries, to a lane, to be replied to from the io callback;
+/// an error is for `execute` to reply with.
+pub fn begin(
+    conn: Connection,
+    request: Request<'_>,
+    vector: Option<Vec<f32>>,
+) -> Result<(), Error> {
     let op = Op::try_from(request)?;
-    let mut job = Job::new(op);
+    let mut job = Job::new(op, vector);
     let waiter = conn.wait_for_io();
     let data: *mut Job = job.as_mut();
     // SAFETY: `wake` takes back the box, which the lane never frees, once the lane is done with it.
@@ -61,7 +65,7 @@ mod tests {
             index: "idx",
             vkey: "v",
         };
-        assert_eq!(begin(conn.connection(), request), Ok(()));
+        assert_eq!(begin(conn.connection(), request, None), Ok(()));
         assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), 7);
         assert!(conn.reply().is_empty());
         assert!(conn.run_callback());

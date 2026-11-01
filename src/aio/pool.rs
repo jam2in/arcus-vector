@@ -16,6 +16,8 @@ const NUM_LANES: usize = 32;
 /// One command from a connection, which its lane runs and its io callback replies from.
 pub struct Job {
     op: Op,
+    #[expect(dead_code, reason = "no command runs yet")]
+    vector: Option<Vec<f32>>,
     pub result: Result<(), Error>,
     #[expect(dead_code, reason = "no command succeeds yet")]
     data: Data,
@@ -24,9 +26,10 @@ pub struct Job {
 impl Job {
     /// Not supported until its lane runs it; on the heap, so the core can hold it, and never
     /// freed by its holder: the io callback frees it with `Box::from_raw`.
-    pub fn new(op: Op) -> ManuallyDrop<Box<Self>> {
+    pub fn new(op: Op, vector: Option<Vec<f32>>) -> ManuallyDrop<Box<Self>> {
         ManuallyDrop::new(Box::new(Self {
             op,
+            vector,
             result: Err(Error::NotSupported),
             data: Data,
         }))
@@ -233,7 +236,7 @@ mod tests {
         let conns: Vec<_> = (0..100).map(|id| fake::Conn::new(id, &tx)).collect();
         let mut jobs: Vec<*mut Job> = Vec::new();
         for conn in &conns {
-            let mut job = Job::new(Op::Search);
+            let mut job = Job::new(Op::Search, None);
             jobs.push(job.as_mut());
             let waiter = conn.connection().wait_for_io();
             send(&lanes()[3], Task { job, waiter });

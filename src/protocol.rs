@@ -72,7 +72,9 @@ pub struct Create<'a> {
     pub index: &'a str,
     pub dim: u16,
     pub exptime: u32,
-    pub maxcount: Option<u32>,
+    /// 0 when omitted: the engine takes 0 as its default (4000), and caps any count at
+    /// `max_map_size`.
+    pub maxcount: u32,
     pub metric: MetricKind,
     pub quant: ScalarKind,
     pub m: usize,
@@ -150,7 +152,20 @@ impl<'a> Request<'a> {
         }
     }
 
-    /// The lengths of the body segments the line declares, in the order they arrive.
+    /// The format of the vector the body carries, if it carries one.
+    pub const fn vector_format(&self) -> Option<Format> {
+        match self {
+            Self::Upsert(u) => Some(u.format),
+            Self::Search(Search {
+                source: Source::Vector { format, .. },
+                ..
+            }) => Some(*format),
+            _ => None,
+        }
+    }
+
+    /// The lengths of the body segments the line declares, in the order they arrive; the vector,
+    /// if any, is the second.
     pub const fn segments(&self) -> [Option<usize>; 2] {
         match self {
             Self::Upsert(u) => [u.meta_bytes, Some(u.vector_bytes)],
@@ -265,7 +280,8 @@ fn create<'a>(args: &mut Args<'_, 'a>) -> Result<Create<'a>, Error> {
     let maxcount = args
         .optional_number()
         .map(|n| in_range(n, &(1..=u32::MAX)))
-        .transpose()?;
+        .transpose()?
+        .unwrap_or(0);
 
     let (mut metric, mut quant, mut m, mut efc, mut efs) = (None, None, None, None, None);
     while !args.is_empty() {
@@ -398,7 +414,7 @@ mod tests {
     fn describe(request: &Request<'_>) -> String {
         match request {
             Request::Create(c) => format!(
-                "create {} {} {} {:?} {:?} {:?} {} {} {}",
+                "create {} {} {} {} {:?} {:?} {} {} {}",
                 c.index, c.dim, c.exptime, c.maxcount, c.metric, c.quant, c.m, c.efc, c.efs
             ),
             Request::Upsert(u) => format!(
@@ -426,15 +442,15 @@ mod tests {
     fn create_takes_defaults_and_options() {
         assert_eq!(
             parse_line("vop create idx 128 0").unwrap(),
-            "create idx 128 0 None Cos F32 16 128 64"
+            "create idx 128 0 0 Cos F32 16 128 64"
         );
         assert_eq!(
             parse_line("vop create idx 2 60 100 metric l2 quant f16 M 32 efc 200 efs 10").unwrap(),
-            "create idx 2 60 Some(100) L2sq F16 32 200 10"
+            "create idx 2 60 100 L2sq F16 32 200 10"
         );
         assert_eq!(
             parse_line("vop CREATE idx 8 0 metric hamming quant b1").unwrap(),
-            "create idx 8 0 None Hamming B1 16 128 64"
+            "create idx 8 0 0 Hamming B1 16 128 64"
         );
     }
 
