@@ -16,6 +16,7 @@ use usearch::{MetricKind, ScalarKind};
 use crate::bson;
 use crate::error::Error;
 use crate::memcached::ffi::MAX_FIELD_LENG;
+use crate::quant::Vector;
 
 pub use tokens::Tokens;
 #[cfg(test)]
@@ -96,8 +97,8 @@ pub struct Upsert<'a> {
     pub index: &'a str,
     pub vkey: &'a str,
     pub vector_bytes: usize,
-    /// The vector the body carries, as its index's `f32`s; empty until the body is read.
-    pub vector: Vec<f32>,
+    /// The vector the body carries, in its index's scalar kind; empty until the body is read.
+    pub vector: Vector,
     pub meta_bytes: Option<usize>,
     /// The metadata the body carries, as BSON; an empty document if it carries none.
     pub meta: Vec<u8>,
@@ -126,9 +127,9 @@ pub enum Source<'a> {
 pub struct Search<'a> {
     pub index: &'a str,
     pub source: Source<'a>,
-    /// The vector to search by, as its index's `f32`s: from the body for a vector source, empty
-    /// until it is read.
-    pub vector: Vec<f32>,
+    /// The vector to search by, in its index's scalar kind: from the body for a vector source,
+    /// empty until it is read.
+    pub vector: Vector,
     pub k: usize,
     pub filter_bytes: Option<usize>,
     pub with_meta: bool,
@@ -191,7 +192,7 @@ impl<'a> Request<'a> {
     }
 
     /// Fills in the vector read from the body, for a request that carries one.
-    pub fn set_vector(&mut self, read: Vec<f32>) {
+    pub fn set_vector(&mut self, read: Vector) {
         match self {
             Self::Upsert(u) => u.vector = read,
             Self::Search(s) => s.vector = read,
@@ -365,7 +366,7 @@ fn upsert<'a>(args: &mut Args<'_, 'a>) -> Result<Upsert<'a>, Error> {
         index,
         vkey,
         vector_bytes,
-        vector: Vec::new(),
+        vector: Vector::default(),
         meta_bytes,
         meta: bson::EMPTY.to_vec(),
         format: format.unwrap_or_default(),
@@ -414,7 +415,7 @@ fn search<'a>(args: &mut Args<'_, 'a>) -> Result<Search<'a>, Error> {
     Ok(Search {
         index,
         source,
-        vector: Vec::new(),
+        vector: Vector::default(),
         k: in_range(k, &(1..=MAX_RESULTS))?,
         filter_bytes,
         with_meta,

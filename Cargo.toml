@@ -54,6 +54,8 @@ use_self = "warn"
 or_fun_call = "warn"
 
 [dependencies]
+# Also usearch's own SIMD backend; its casts quantize vectors.
+numkong = "7.8"
 usearch = "2.26"
 # Metadata keeps its key order through the JSON → BSON → JSON round trip.
 serde_json = { version = "1", features = ["preserve_order"] }
