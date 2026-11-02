@@ -6,6 +6,7 @@ use crate::error::Error;
 use crate::index;
 use crate::memcached::server::Connection;
 use crate::protocol::{self, MAX_BODY_BYTES, MAX_ELEMENT_BYTES, Request, Tokens};
+use crate::quant;
 
 pub enum Body {
     None,
@@ -68,8 +69,8 @@ impl Pending {
 
 /// Refuses an element of `index` with `meta` that the core would refuse as too long.
 fn check_element(index: &str, meta: &[u8]) -> Result<(), Error> {
-    let dim = index::dimensions(index).ok_or(Error::NotFound)?;
-    if meta.len() + dim * size_of::<f32>() + 2 > MAX_ELEMENT_BYTES {
+    let (dim, kind) = index::layout(index).ok_or(Error::NotFound)?;
+    if meta.len() + quant::byte_len(dim, kind) + 2 > MAX_ELEMENT_BYTES {
         return Err(Error::TooLargeValue);
     }
     Ok(())
@@ -104,15 +105,20 @@ mod tests {
 
     #[test]
     fn an_element_past_the_core_limit_is_too_large() {
-        let words = Tokens::from_line("vop create toolarge 4 0");
-        let Ok(Request::Create(spec)) = protocol::parse(words.words()) else {
-            panic!("a create line");
-        };
-        assert_eq!(index::create(&spec), Ok(()));
-        let fits = vec![0; MAX_ELEMENT_BYTES - 2 - 4 * 4];
-        assert_eq!(check_element("toolarge", &fits), Ok(()));
-        let over = [fits, vec![0]].concat();
-        assert_eq!(check_element("toolarge", &over), Err(Error::TooLargeValue));
+        for (line, vector) in [
+            ("vop create toolarge 4 0", 4 * 4),
+            ("vop create toolarge_b1 16 0 metric hamming quant b1", 2),
+        ] {
+            let words = Tokens::from_line(line);
+            let Ok(Request::Create(spec)) = protocol::parse(words.words()) else {
+                panic!("a create line");
+            };
+            assert_eq!(index::create(&spec), Ok(()));
+            let fits = vec![0; MAX_ELEMENT_BYTES - 2 - vector];
+            assert_eq!(check_element(spec.index, &fits), Ok(()));
+            let over = [fits, vec![0]].concat();
+            assert_eq!(check_element(spec.index, &over), Err(Error::TooLargeValue));
+        }
         assert_eq!(check_element("missing", &[]), Err(Error::NotFound));
     }
 
