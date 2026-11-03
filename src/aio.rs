@@ -6,23 +6,31 @@ use std::sync::{Arc, OnceLock};
 
 use crate::error::Error;
 use crate::guard;
-use crate::memcached::server::{Connection, ResponseHandler};
-use crate::protocol::Request;
-use pool::Op;
-pub use pool::start;
+use crate::memcached::server::{Connection, IoWaiter, ResponseHandler};
+pub use pool::{Op, start, submit as begin};
 
-/// Hands `request` to a lane, to be replied to from the io callback; an error is for `execute` to
-/// reply with.
-pub fn begin(conn: Connection, request: Request<'_>) -> Result<(), Error> {
-    let op = Op::new(request)?;
-    let reply = Arc::new(OnceLock::new());
-    // SAFETY: the only caller, `cmd::run`, runs in `execute`.
-    let waiter = unsafe { conn.wait_for_io() };
-    let data = Arc::into_raw(Arc::clone(&reply));
-    // SAFETY: as above, and `wake` takes back the count `data` holds.
-    unsafe { conn.on_io_complete(wake, data.cast_mut().cast()) };
-    pool::submit(op, reply, waiter);
-    Ok(())
+/// A connection waiting for a lane to answer it from the io callback; dropped unanswered, it
+/// answers an internal error.
+pub struct Waiter {
+    reply: Arc<OnceLock<Cow<'static, [u8]>>>,
+    _wait: IoWaiter,
+}
+
+impl Waiter {
+    pub fn new(conn: Connection) -> Self {
+        let reply = Arc::new(OnceLock::new());
+        // SAFETY: its callers, `cmd::run` and `event::offer`, run in `execute`.
+        let wait = unsafe { conn.wait_for_io() };
+        let data = Arc::into_raw(Arc::clone(&reply));
+        // SAFETY: as above, and `wake` takes back the count `data` holds.
+        unsafe { conn.on_io_complete(wake, data.cast_mut().cast()) };
+        Self { reply, _wait: wait }
+    }
+
+    /// Leaves `reply` for the io callback, then wakes the connection.
+    pub fn answer(self, reply: Cow<'static, [u8]>) {
+        let _ = self.reply.set(reply);
+    }
 }
 
 unsafe extern "C" fn wake(
@@ -33,13 +41,18 @@ unsafe extern "C" fn wake(
     guard(
         || false,
         || {
-            // SAFETY: `data` is the count from `begin`, and the core calls this once.
+            // SAFETY: `data` is the count from `Waiter::new`, and the core calls this once.
             let reply = unsafe { Arc::from_raw(data.cast::<OnceLock<Cow<'static, [u8]>>>()) };
             let reply = reply.get().map_or(Error::Internal.reply(), AsRef::as_ref);
             // SAFETY: the server is running the io callback for `cookie`, with `handler`.
             unsafe { Connection::new(cookie, handler).respond(reply) }
         },
     )
+}
+
+#[cfg(test)]
+pub fn start_once() {
+    pool::start_once();
 }
 
 #[cfg(test)]
@@ -50,7 +63,7 @@ mod tests {
     use super::*;
     use crate::index;
     use crate::memcached::server::fake;
-    use crate::protocol::{self, Tokens};
+    use crate::protocol::{self, Request, Tokens};
     use crate::quant::Vector;
 
     #[test]
@@ -68,7 +81,10 @@ mod tests {
         let tokens = Tokens::from_line("vop search aio vector 16 3");
         let mut request = protocol::parse(tokens.words()).unwrap();
         request.set_vector(Vector::F32(vec![0.0; 4]));
-        assert_eq!(begin(conn.connection(), request), Ok(()));
+        begin(
+            Op::new(request).unwrap(),
+            Some(Waiter::new(conn.connection())),
+        );
         assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), 7);
         assert!(conn.reply().is_empty());
         assert!(conn.run_callback());
