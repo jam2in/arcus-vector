@@ -22,6 +22,13 @@ pub type IoCallback = unsafe extern "C" fn(
     handler: ResponseHandler,
 ) -> bool;
 
+pub type EventCallback = unsafe extern "C" fn(
+    cookie: *const c_void,
+    type_: ENGINE_EVENT_TYPE,
+    data: *const c_void,
+    cb_data: *const c_void,
+);
+
 #[expect(dead_code, reason = "the commands that use the rest are not in yet")]
 struct Api {
     get_server_api: GetServerApi,
@@ -139,6 +146,15 @@ pub unsafe fn register_ascii(descriptor: *mut EXTENSION_ASCII_PROTOCOL_DESCRIPTO
     let kind = extension_type_t_EXTENSION_ASCII_PROTOCOL;
     // SAFETY: the caller guarantees `descriptor` outlives its registration.
     unsafe { (api().register_extension)(kind, descriptor.cast()) }
+}
+
+/// # Safety
+///
+/// `cb` must take what the server passes with a `type_` event.
+pub unsafe fn register_callback(type_: ENGINE_EVENT_TYPE, cb: EventCallback) {
+    // SAFETY: the caller guarantees `cb` takes `type_` events; the server ignores the engine and
+    // keeps no pointer of ours.
+    unsafe { (api().register_callback)(ptr::null_mut(), type_, Some(cb), ptr::null()) };
 }
 
 /// A client connection, as the server names it to the extension.
@@ -323,7 +339,9 @@ pub mod fake {
     unsafe extern "C" fn notify_io_complete(cookie: *const c_void, _: ENGINE_ERROR_CODE) {
         // SAFETY: the cookie is a `Conn`, alive until its notify.
         let conn = unsafe { conn(cookie) };
-        let _ = conn.notified.send(conn.id);
+        // The test may drop `conn` once the id arrives, so the send must not use its sender.
+        let (notified, id) = (conn.notified.clone(), conn.id);
+        let _ = notified.send(id);
     }
 
     unsafe extern "C" fn on_io_complete(

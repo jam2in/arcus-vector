@@ -1,4 +1,4 @@
-use crate::aio;
+use crate::aio::{self, Op, Waiter};
 use crate::error::Error;
 use crate::index;
 use crate::memcached::server::Connection;
@@ -13,8 +13,11 @@ pub fn run(conn: Connection, request: Result<Request<'_>, Error>) -> bool {
             Err(e) => e.reply(),
         },
         Ok(request) if index::dimensions(request.index()).is_none() => Error::NotFound.reply(),
-        Ok(request) => match aio::begin(conn, request) {
-            Ok(()) => return true,
+        Ok(request) => match Op::new(request) {
+            Ok(op) => {
+                aio::begin(op, Some(Waiter::new(conn)));
+                return true;
+            }
             Err(e) => e.reply(),
         },
         Err(e) => e.reply(),
