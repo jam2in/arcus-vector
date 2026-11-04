@@ -7,7 +7,7 @@ use std::sync::{Arc, OnceLock};
 use crate::error::Error;
 use crate::guard;
 use crate::memcached::server::{Connection, IoWaiter, ResponseHandler};
-pub use pool::{Op, start, submit as begin};
+pub use pool::{NUM_LANES, Op, start, submit as begin};
 
 /// A connection waiting for a lane to answer it from the io callback; dropped unanswered, it
 /// answers an internal error.
