@@ -20,7 +20,6 @@ pub struct Graph {
     kind: ScalarKind,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "the lanes run no op yet"))]
 impl Graph {
     pub fn new(options: &IndexOptions) -> Result<Self, Error> {
         let index = Index::new(options).map_err(|_| Error::Internal)?;
@@ -62,19 +61,28 @@ impl Graph {
         Ok(())
     }
 
+    pub fn contains(&self, key: u64) -> bool {
+        self.read().contains(key)
+    }
+
     pub fn remove(&self, key: u64) -> Result<bool, Error> {
-        let removed = self.read().remove(key).map_err(|_| Error::Internal)?;
-        Ok(removed > 0)
+        Ok(self.read().remove(key).map_err(|_| Error::Internal)? > 0)
     }
 
     pub fn rename(&self, from: u64, to: u64) -> Result<bool, Error> {
-        let renamed = self.read().rename(from, to).map_err(|_| Error::Internal)?;
-        Ok(renamed > 0)
+        Ok(self.read().rename(from, to).map_err(|_| Error::Internal)? > 0)
     }
 
-    pub fn search(&self, query: &Vector, count: usize) -> Result<Vec<(u64, f32)>, Error> {
+    /// Runs `f` on what a search finds, before any key it found can leave: a key removed
+    /// or renamed meanwhile stays readable until [`Graph::wait_for_searches`] returns.
+    pub fn search_with<T>(
+        &self,
+        query: &Vector,
+        count: usize,
+        f: impl FnOnce(&[(u64, f32)]) -> Result<T, Error>,
+    ) -> Result<T, Error> {
         if !self.populated.load(Ordering::Acquire) {
-            return Ok(Vec::new());
+            return f(&[]);
         }
         let index = self.read();
         let count = count.min(index.size().max(1));
@@ -87,8 +95,18 @@ impl Graph {
         .map_err(|_| Error::Internal)?;
         // usearch reads a result's key from its slot only as it hands the result out; a remove
         // meanwhile leaves the free key there, which names no element.
-        let found = matches.keys.into_iter().zip(matches.distances);
-        Ok(found.filter(|&(key, _)| key != FREE_KEY).collect())
+        let found: Vec<(u64, f32)> = matches
+            .keys
+            .into_iter()
+            .zip(matches.distances)
+            .filter(|&(key, _)| key != FREE_KEY)
+            .collect();
+        f(&found)
+    }
+
+    /// Returns once every search that started before has finished with what it found.
+    pub fn wait_for_searches(&self) {
+        drop(self.index.write().unwrap_or_else(PoisonError::into_inner));
     }
 
     fn reserve(&self, needed: usize) -> Result<(), Error> {
@@ -125,6 +143,10 @@ mod tests {
     use super::*;
     use crate::quant;
 
+    fn search(g: &Graph, query: &Vector, count: usize) -> Result<Vec<(u64, f32)>, Error> {
+        g.search_with(query, count, |found| Ok(found.to_vec()))
+    }
+
     fn graph(dim: usize, kind: ScalarKind) -> Graph {
         let metric = if kind == ScalarKind::B1 {
             MetricKind::Hamming
@@ -147,7 +169,7 @@ mod tests {
     #[test]
     fn a_search_before_any_add_finds_nothing() {
         let g = graph(4, ScalarKind::F32);
-        let found = g.search(&vector(&[1.0, 0.0, 0.0, 0.0], ScalarKind::F32), 3);
+        let found = search(&g, &vector(&[1.0, 0.0, 0.0, 0.0], ScalarKind::F32), 3);
         assert_eq!(found, Ok(Vec::new()));
     }
 
@@ -164,7 +186,7 @@ mod tests {
             let far = [-1.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 1.0];
             assert_eq!(g.add(10, &vector(&near, kind)), Ok(()));
             assert_eq!(g.add(20, &vector(&far, kind)), Ok(()));
-            let found = g.search(&vector(&near, kind), 1).unwrap();
+            let found = search(&g, &vector(&near, kind), 1).unwrap();
             assert_eq!(found.first().map(|&(key, _)| key), Some(10), "{kind:?}");
         }
     }
@@ -174,7 +196,11 @@ mod tests {
         let g = graph(4, ScalarKind::F32);
         g.add(1, &vector(&[1.0, 0.0, 0.0, 0.0], ScalarKind::F32))
             .unwrap();
-        let found = g.search(&vector(&[1.0, 0.0, 0.0, 0.0], ScalarKind::F32), usize::MAX);
+        let found = search(
+            &g,
+            &vector(&[1.0, 0.0, 0.0, 0.0], ScalarKind::F32),
+            usize::MAX,
+        );
         assert_eq!(found.map(|f| f.len()), Ok(1));
     }
 
@@ -196,7 +222,7 @@ mod tests {
         g.add(1, &v).unwrap();
         assert_eq!(g.rename(1, 2), Ok(true));
         assert_eq!(g.rename(1, 3), Ok(false));
-        assert_eq!(g.search(&v, 1).unwrap()[0].0, 2);
+        assert_eq!(search(&g, &v, 1).unwrap()[0].0, 2);
         assert_eq!(g.remove(2), Ok(true));
         assert_eq!(g.remove(2), Ok(false));
         assert_eq!(g.len(), 0);
@@ -211,7 +237,7 @@ mod tests {
                 s.spawn(move || {
                     for n in 0..600u64 {
                         let q = vector(&[t as f32, n as f32, 1.0, 0.0], ScalarKind::F32);
-                        assert!(g.search(&q, 3).is_ok());
+                        assert!(search(g, &q, 3).is_ok());
                     }
                 });
             }
