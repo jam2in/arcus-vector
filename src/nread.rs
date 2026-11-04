@@ -105,19 +105,16 @@ mod tests {
 
     #[test]
     fn an_element_past_the_core_limit_is_too_large() {
-        for (line, vector) in [
-            ("vop create toolarge 4 0", 4 * 4),
-            ("vop create toolarge_b1 16 0 metric hamming quant b1", 2),
+        for (name, dim, metric, quant, vector) in [
+            ("toolarge", 4, "cos", "f32", 4 * 4),
+            ("toolarge_b1", 16, "hamming", "b1", 2),
         ] {
-            let words = Tokens::from_line(line);
-            let Ok(Request::Create(spec)) = protocol::parse(words.words()) else {
-                panic!("a create line");
-            };
-            assert_eq!(index::create(&spec), Ok(()));
+            let config = index::test_config(dim, metric, quant);
+            assert_eq!(index::create_with(name, 0, &config), Ok(()));
             let fits = vec![0; MAX_ELEMENT_BYTES - 2 - vector];
-            assert_eq!(check_element(spec.index, &fits), Ok(()));
+            assert_eq!(check_element(name, &fits), Ok(()));
             let over = [fits, vec![0]].concat();
-            assert_eq!(check_element(spec.index, &over), Err(Error::TooLargeValue));
+            assert_eq!(check_element(name, &over), Err(Error::TooLargeValue));
         }
         assert_eq!(check_element("missing", &[]), Err(Error::NotFound));
     }

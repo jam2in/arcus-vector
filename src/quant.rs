@@ -21,6 +21,40 @@ impl Default for Vector {
     }
 }
 
+impl Vector {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the write commands are not in yet")
+    )]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::F32(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            Self::F16(v) => v.iter().flat_map(|x| x.0.to_le_bytes()).collect(),
+            Self::I8(v) => v.iter().map(|&x| x as u8).collect(),
+            Self::B1(v) => v.clone(),
+        }
+    }
+
+    pub fn from_bytes(bytes: &[u8], kind: ScalarKind) -> Option<Self> {
+        Some(match kind {
+            ScalarKind::F32 => {
+                let (words, rest) = bytes.as_chunks();
+                rest.is_empty()
+                    .then(|| Self::F32(words.iter().map(|&w| f32::from_le_bytes(w)).collect()))?
+            }
+            ScalarKind::F16 => {
+                let (halves, rest) = bytes.as_chunks();
+                rest.is_empty().then(|| {
+                    Self::F16(halves.iter().map(|&h| f16(u16::from_le_bytes(h))).collect())
+                })?
+            }
+            ScalarKind::I8 => Self::I8(bytes.iter().map(|&b| b as i8).collect()),
+            ScalarKind::B1 => Self::B1(bytes.to_vec()),
+            _ => return None,
+        })
+    }
+}
+
 /// `vector` as `kind`, which must be one an index can be created with.
 pub fn quantize(vector: Vec<f32>, kind: ScalarKind) -> Result<Vector, Error> {
     match kind {
@@ -141,5 +175,20 @@ mod tests {
             quantize(v.to_vec(), ScalarKind::B1),
             Ok(Vector::B1(vec![0b1001_1001, 0b1000_0000]))
         );
+    }
+
+    #[test]
+    fn bytes_come_back_as_the_same_vector() {
+        let values = vec![1.0, -2.5, 0.25, 7.0, -1.0, 0.0, 3.0, 2.0, -0.5];
+        for kind in [
+            ScalarKind::F32,
+            ScalarKind::F16,
+            ScalarKind::I8,
+            ScalarKind::B1,
+        ] {
+            let vector = quantize(values.clone(), kind).unwrap();
+            assert_eq!(Vector::from_bytes(&vector.to_bytes(), kind), Some(vector));
+        }
+        assert_eq!(Vector::from_bytes(&[0; 3], ScalarKind::F32), None);
     }
 }

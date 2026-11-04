@@ -3,11 +3,6 @@
 //! The document holds only what JSON has: every integer is an int64, and a `$` key such as
 //! `{"$numberLong":"5"}` is a plain field, not extended JSON.
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the commands that store metadata are not in yet")
-)]
-
 use serde_json::Value as Json;
 
 use crate::error::Error;

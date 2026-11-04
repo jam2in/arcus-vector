@@ -8,10 +8,7 @@ use crate::quant::{self, Vector};
 /// Runs `request` on `conn`, replying now or once a lane is done.
 pub fn run(conn: Connection, request: Result<Request<'_>, Error>) -> bool {
     let reply = match request {
-        Ok(Request::Create(spec)) => match index::create(&spec) {
-            Ok(()) => b"CREATED\r\n",
-            Err(e) => e.reply(),
-        },
+        Ok(Request::Create(_)) => Error::NotSupported.reply(),
         Ok(request) if index::dimensions(request.index()).is_none() => Error::NotFound.reply(),
         Ok(request) => match Op::new(request) {
             Ok(op) => {
@@ -61,11 +58,6 @@ pub fn read_vector(index: &str, bytes: &[u8], format: Format) -> Result<Vector, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{self, Tokens};
-
-    fn on_line<T>(line: &str, f: impl FnOnce(Request<'_>) -> T) -> T {
-        f(protocol::parse(Tokens::from_line(line).words()).unwrap())
-    }
 
     #[test]
     fn a_missing_index_is_not_found() {
@@ -77,10 +69,7 @@ mod tests {
 
     #[test]
     fn a_vector_is_read_as_its_index_dimensions() {
-        let created = on_line("vop create four 4 0", |request| match request {
-            Request::Create(spec) => index::create(&spec),
-            _ => unreachable!(),
-        });
+        let created = index::create_with("four", 0, &index::test_config(4, "cos", "f32"));
         assert_eq!(created, Ok(()));
         let bin: Vec<u8> = [1.0f32, -2.5, 0.0, 3.25]
             .iter()
