@@ -12,7 +12,7 @@ use crate::error::Error;
 use crate::protocol::{Request, Search, Source};
 use crate::quant::Vector;
 
-const NUM_LANES: usize = 32;
+pub const NUM_LANES: usize = 32;
 
 /// An op for a lane, and the connection it answers: none for a change from replication or replay.
 struct Task {
