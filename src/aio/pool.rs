@@ -12,7 +12,7 @@ use crate::memcached::server::IoWait;
 use crate::protocol::{Request, Search, Source};
 use crate::quant::Vector;
 
-const NUM_LANES: usize = 32;
+pub const NUM_LANES: usize = 32;
 
 /// An op for a lane, where it leaves the reply for the io callback, and the connection to wake once
 /// it is done: none for a change from replication or replay.

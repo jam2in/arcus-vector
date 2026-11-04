@@ -1,12 +1,15 @@
-use std::collections::HashMap;
-use std::sync::{LazyLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+mod graph;
 
-use usearch::{Index, IndexOptions, ScalarKind};
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+use usearch::{IndexOptions, ScalarKind};
 
 use crate::error::Error;
 use crate::protocol::Create;
+pub use graph::Graph;
 
-static INDEXES: LazyLock<RwLock<HashMap<String, Index>>> = LazyLock::new(RwLock::default);
+static INDEXES: LazyLock<RwLock<HashMap<String, Arc<Graph>>>> = LazyLock::new(RwLock::default);
 
 /// Builds the index `spec` describes and registers it under its name.
 pub fn create(spec: &Create<'_>) -> Result<(), Error> {
@@ -14,31 +17,36 @@ pub fn create(spec: &Create<'_>) -> Result<(), Error> {
     if read().contains_key(spec.index) {
         return Err(Error::Exists);
     }
-    let index = Index::new(&options(spec)).map_err(|_| Error::Internal)?;
+    let graph = Arc::new(Graph::new(&options(spec))?);
     let mut indexes = write();
     if indexes.contains_key(spec.index) {
         return Err(Error::Exists);
     }
-    indexes.insert(spec.index.to_owned(), index);
+    indexes.insert(spec.index.to_owned(), graph);
     Ok(())
 }
 
+#[expect(dead_code, reason = "the lanes run no op yet")]
+pub fn get(name: &str) -> Option<Arc<Graph>> {
+    read().get(name).cloned()
+}
+
 pub fn dimensions(name: &str) -> Option<usize> {
-    read().get(name).map(Index::dimensions)
+    read().get(name).map(|graph| graph.dimensions())
 }
 
 /// The dimensions and scalar kind of the index at `name`.
 pub fn layout(name: &str) -> Option<(usize, ScalarKind)> {
     read()
         .get(name)
-        .map(|index| (index.dimensions(), index.scalar_kind()))
+        .map(|graph| (graph.dimensions(), graph.scalar_kind()))
 }
 
-fn read() -> RwLockReadGuard<'static, HashMap<String, Index>> {
+fn read() -> RwLockReadGuard<'static, HashMap<String, Arc<Graph>>> {
     INDEXES.read().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn write() -> RwLockWriteGuard<'static, HashMap<String, Index>> {
+fn write() -> RwLockWriteGuard<'static, HashMap<String, Arc<Graph>>> {
     INDEXES.write().unwrap_or_else(PoisonError::into_inner)
 }
 
