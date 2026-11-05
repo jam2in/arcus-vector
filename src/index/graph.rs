@@ -73,8 +73,7 @@ impl Graph {
         Ok(self.read().rename(from, to).map_err(|_| Error::Internal)? > 0)
     }
 
-    /// Runs `f` on what a search finds, before any key it found can leave: a key removed
-    /// or renamed meanwhile stays readable until [`Graph::wait_for_searches`] returns.
+    /// Runs `f` on what a search finds.
     pub fn search_with<T>(
         &self,
         query: &Vector,
@@ -102,11 +101,6 @@ impl Graph {
             .filter(|&(key, _)| key != FREE_KEY)
             .collect();
         f(&found)
-    }
-
-    /// Returns once every search that started before has finished with what it found.
-    pub fn wait_for_searches(&self) {
-        drop(self.index.write().unwrap_or_else(PoisonError::into_inner));
     }
 
     fn reserve(&self, needed: usize) -> Result<(), Error> {

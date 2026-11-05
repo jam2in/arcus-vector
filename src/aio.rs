@@ -1,5 +1,6 @@
 mod ops;
 mod pool;
+mod sweeper;
 
 use std::borrow::Cow;
 use std::os::raw::c_void;
