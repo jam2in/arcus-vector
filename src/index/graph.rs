@@ -14,6 +14,9 @@ const FREE_KEY: u64 = u64::MAX;
 
 pub struct Graph {
     index: RwLock<Index>,
+    /// Held by the commands in the graph, and alone by [`Graph::close`].
+    entry: RwLock<()>,
+    closed: AtomicBool,
     reserved: AtomicUsize,
     populated: AtomicBool,
     dim: usize,
@@ -28,6 +31,8 @@ impl Graph {
             .map_err(|_| Error::OutOfMemory)?;
         Ok(Self {
             index: RwLock::new(index),
+            entry: RwLock::new(()),
+            closed: AtomicBool::new(false),
             reserved: AtomicUsize::new(MIN_CAPACITY),
             populated: AtomicBool::new(false),
             dim: options.dimensions,
@@ -41,6 +46,28 @@ impl Graph {
 
     pub fn scalar_kind(&self) -> ScalarKind {
         self.kind
+    }
+
+    pub fn layout(&self) -> (usize, ScalarKind) {
+        (self.dim, self.kind)
+    }
+
+    /// Keeps the graph's name from passing to another until the guard drops, so a command reads
+    /// the graph and writes its Map as one; `None` once closed.
+    pub fn enter(&self) -> Option<RwLockReadGuard<'_, ()>> {
+        let entered = self.entry.read().unwrap_or_else(PoisonError::into_inner);
+        self.is_open().then_some(entered)
+    }
+
+    /// Bars commands from the graph, once those that entered it are done.
+    pub fn close(&self) {
+        let _alone = self.entry.write().unwrap_or_else(PoisonError::into_inner);
+        self.closed.store(true, Ordering::Release);
+    }
+
+    /// Never waits, unlike [`Graph::enter`], so the registry's lock may be held around it.
+    pub fn is_open(&self) -> bool {
+        !self.closed.load(Ordering::Acquire)
     }
 
     pub fn len(&self) -> usize {
@@ -145,6 +172,10 @@ fn as_usearch_f16(v: &[f16]) -> &[usearch::f16] {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
     use usearch::MetricKind;
 
     use super::*;
@@ -267,7 +298,7 @@ mod tests {
     #[test]
     fn its_lane_adds_while_others_search_as_it_grows() {
         let g = graph(4, ScalarKind::F32);
-        std::thread::scope(|s| {
+        thread::scope(|s| {
             let g = &g;
             for t in 0..3u64 {
                 s.spawn(move || {
@@ -283,5 +314,21 @@ mod tests {
             }
         });
         assert_eq!(g.len(), 2400);
+    }
+
+    #[test]
+    fn a_close_waits_for_the_commands_in_the_graph_then_bars_the_rest() {
+        let g = Arc::new(graph(4, ScalarKind::F32));
+        let entered = g.enter().unwrap();
+        let closer = thread::spawn({
+            let g = Arc::clone(&g);
+            move || g.close()
+        });
+        thread::sleep(Duration::from_millis(50));
+        assert!(!closer.is_finished());
+        drop(entered);
+        closer.join().unwrap();
+        assert!(!g.is_open());
+        assert!(g.enter().is_none());
     }
 }

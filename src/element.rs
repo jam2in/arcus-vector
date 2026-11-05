@@ -4,6 +4,7 @@
 use bson::RawDocument;
 use usearch::ScalarKind;
 
+use crate::error::Error;
 use crate::memcached::engine::Elem;
 use crate::quant::Vector;
 
@@ -25,9 +26,48 @@ impl Elem {
     pub fn same_vector(&self, other: &Self) -> Option<bool> {
         Some(split(self.value()?)?.1 == split(other.value()?)?.1)
     }
+
+    /// Puts the vector of `old` over the blank one of the same length this has, from
+    /// [`with_blank_vector`].
+    ///
+    /// # Safety
+    ///
+    /// As for [`Elem::value_mut`].
+    pub unsafe fn fill_vector(&mut self, old: &Self) -> Option<()> {
+        let (_, vector) = split(old.value()?)?;
+        // SAFETY: the caller's.
+        let value = unsafe { self.value_mut() }?;
+        let len = u32::from_le_bytes(*value.first_chunk()?);
+        let blank = value.get_mut(usize::try_from(len).ok()?..)?;
+        (blank.len() == vector.len()).then(|| blank.copy_from_slice(vector))
+    }
 }
 
-fn split(value: &[u8]) -> Option<(&[u8], &[u8])> {
+/// An element's value from its metadata document and vector bytes.
+pub fn join(meta: &[u8], vector: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut value = Vec::new();
+    value
+        .try_reserve_exact(meta.len() + vector.len())
+        .map_err(|_| Error::OutOfMemory)?;
+    value.extend_from_slice(meta);
+    value.extend_from_slice(vector);
+    Ok(value)
+}
+
+/// The value `vop setmeta` stores: `meta`, then `len` zero bytes for the vector, which the replace
+/// fills from the element it replaces.
+pub fn with_blank_vector(meta: &[u8], len: usize) -> Result<Vec<u8>, Error> {
+    let mut value = Vec::new();
+    value
+        .try_reserve_exact(meta.len() + len)
+        .map_err(|_| Error::OutOfMemory)?;
+    value.extend_from_slice(meta);
+    value.resize(meta.len() + len, 0);
+    Ok(value)
+}
+
+/// An element's value as its metadata document and vector bytes.
+pub fn split(value: &[u8]) -> Option<(&[u8], &[u8])> {
     let len = u32::from_le_bytes(*value.first_chunk()?);
     value.split_at_checked(usize::try_from(len).ok()?)
 }
@@ -43,5 +83,7 @@ mod tests {
         assert_eq!(split(&value), Some((&doc[..], &[1, 2, 3][..])));
         assert_eq!(split(&[9, 0, 0, 0, 0]), None);
         assert_eq!(split(&[1, 0]), None);
+        assert_eq!(join(&doc, &[1, 2, 3]), Ok(value));
+        assert_eq!(with_blank_vector(&doc, 3), join(&doc, &[0; 3]));
     }
 }

@@ -3,10 +3,11 @@
 use std::os::raw::{c_int, c_void};
 
 use crate::memcached::ffi::{
-    ENGINE_ERROR_CODE, ENGINE_HANDLE, eitem, eitem_info, elems_result, field_t, item, item_attr,
+    ENGINE_ERROR_CODE, ENGINE_HANDLE, ENGINE_ITEM_ATTR, eitem, eitem_info, elems_result, field_t, item, item_attr,
     item_info,
 };
 
+pub type GetAttr = unsafe extern "C" fn(Handle, Cookie, Key, c_int, *mut ENGINE_ITEM_ATTR, u32, *mut item_attr, u16) -> Code;
 pub type Remove = unsafe extern "C" fn(Handle, Cookie, Key, usize, u64, u16) -> Code;
 pub type MapCreate = unsafe extern "C" fn(Handle, Cookie, Key, c_int, *const c_void, c_int, *mut item_attr, u16) -> Code;
 pub type ElemAlloc = unsafe extern "C" fn(Handle, Cookie, Key, c_int, usize, usize, *mut *mut eitem) -> Code;

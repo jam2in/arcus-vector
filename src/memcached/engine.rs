@@ -1,5 +1,3 @@
-#![expect(dead_code, reason = "the commands that use the engine are not in yet")]
-
 #[rustfmt::skip]
 mod fns;
 
@@ -12,8 +10,9 @@ use super::ffi::{
     ENGINE_ERROR_CODE_ENGINE_ELEM_ENOENT, ENGINE_ERROR_CODE_ENGINE_ENOMEM,
     ENGINE_ERROR_CODE_ENGINE_EOVERFLOW, ENGINE_ERROR_CODE_ENGINE_EWOULDBLOCK,
     ENGINE_ERROR_CODE_ENGINE_KEY_EEXISTS, ENGINE_ERROR_CODE_ENGINE_KEY_ENOENT,
-    ENGINE_ERROR_CODE_ENGINE_SUCCESS, ENGINE_HANDLE, ENGINE_ITEM_TYPE_ITEM_TYPE_MAP, eitem,
-    eitem_info, elems_result, engine_interface_v1, field_t, item, item_attr, item_info,
+    ENGINE_ERROR_CODE_ENGINE_SUCCESS, ENGINE_HANDLE, ENGINE_ITEM_ATTR_ATTR_TYPE,
+    ENGINE_ITEM_TYPE_ITEM_TYPE_MAP, eitem, eitem_info, elems_result, engine_interface_v1, field_t,
+    item, item_attr, item_info,
 };
 use super::server::{self, Connection};
 use crate::error::Error;
@@ -65,6 +64,22 @@ impl Store {
             (self.engine.map_struct_create_with_value)(h, c, k, nk, v, nv, &raw mut attr, 0)
         };
         ok(ret)
+    }
+
+    /// Whether an item of any type is at `key`.
+    pub fn exists(&self, key: &str) -> Result<bool> {
+        let (h, c) = (self.handle(), self.cookie);
+        let (k, nk) = (key.as_ptr().cast(), key_len(key)?);
+        let mut id = ENGINE_ITEM_ATTR_ATTR_TYPE;
+        // SAFETY: `item_attr` is a plain C struct, for which all-zero bytes are valid.
+        let mut attr: item_attr = unsafe { std::mem::zeroed() };
+        // SAFETY: `key`, `id` and `attr` outlive the call, which reads one id and fills `attr`.
+        let ret = unsafe { (self.engine.getattr)(h, c, k, nk, &raw mut id, 1, &raw mut attr, 0) };
+        match ok(ret) {
+            Ok(()) => Ok(true),
+            Err(Error::NotFound) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// Removes the item at `key`; a Map's elements go later, from the engine's own thread.
@@ -288,6 +303,25 @@ impl Elem {
         Some(value.strip_suffix(CRLF).unwrap_or(value))
     }
 
+    /// The value without its CRLF, to change in place.
+    ///
+    /// # Safety
+    ///
+    /// Nothing else may read or write the element while the slice lives.
+    pub unsafe fn value_mut(&mut self) -> Option<&mut [u8]> {
+        let info = &self.info;
+        if info.value.is_null() || info.naddnl != 0 {
+            return None;
+        }
+        // SAFETY: as for `value`, and the caller's; the engine hands out a const pointer to the
+        // element's own memory, which it allocated writable.
+        let value = unsafe {
+            std::slice::from_raw_parts_mut(info.value.cast::<u8>().cast_mut(), info.nbytes as usize)
+        };
+        let len = value.len() - if value.ends_with(CRLF) { CRLF.len() } else { 0 };
+        Some(&mut value[..len])
+    }
+
     /// Gives back the reference we hold.
     pub fn release(self) {
         if self.elem.is_null() {
@@ -301,6 +335,7 @@ impl Elem {
 /// The engine functions arcus-vector calls.
 struct Engine {
     interface: &'static engine_interface_v1,
+    getattr: fns::GetAttr,
     remove: fns::Remove,
     map_struct_create_with_value: fns::MapCreate,
     map_elem_alloc: fns::ElemAlloc,
@@ -336,6 +371,7 @@ impl Engine {
     fn new(interface: &'static engine_interface_v1) -> Option<Self> {
         Some(Self {
             interface,
+            getattr: interface.getattr?,
             remove: interface.remove?,
             map_struct_create_with_value: interface.map_struct_create_with_value?,
             map_elem_alloc: interface.map_elem_alloc?,

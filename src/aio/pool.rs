@@ -9,7 +9,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use super::{Waiter, ops, sweeper};
 use crate::error::Error;
 use crate::filter::Filter;
-use crate::protocol::{Request, Search, Source};
+use crate::protocol::{Request, Search};
 use crate::quant::Vector;
 
 pub const NUM_LANES: usize = 32;
@@ -40,7 +40,6 @@ impl Op {
         match request {
             Request::Search(Search {
                 index,
-                source: Source::Vector { .. },
                 vector,
                 k,
                 filter,

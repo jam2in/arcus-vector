@@ -61,6 +61,10 @@ impl Pending {
             Request::SetMeta(s) => s.meta = bson::from_json(extra)?,
             _ => {}
         }
+        // Without the index there is nothing to read the vector as; the command says why.
+        if index::layout(request.index()).is_none() {
+            return Ok(request);
+        }
         if let Some(format) = request.vector_format() {
             request.set_vector(cmd::read_vector(request.index(), bytes, format)?);
         }

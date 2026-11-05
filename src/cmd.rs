@@ -1,25 +1,135 @@
+use std::borrow::Cow;
+use std::sync::Arc;
+
+use usearch::ScalarKind;
+
 use crate::aio::{self, Op, Waiter};
+use crate::bson;
+use crate::element;
 use crate::error::Error;
-use crate::index;
-use crate::memcached::server::Connection;
-use crate::protocol::{Format, Request};
+use crate::event::{self, Expect};
+use crate::index::{self, Graph};
+use crate::memcached::engine::{self, Store};
+use crate::memcached::server::{self, Connection};
+use crate::protocol::{Format, Request, Source};
 use crate::quant::{self, Vector};
+
+/// A reply now, or `None` once a lane has the connection to reply to.
+type Reply = Option<Cow<'static, [u8]>>;
 
 /// Runs `request` on `conn`, replying now or once a lane is done.
 pub fn run(conn: Connection, request: Result<Request<'_>, Error>) -> bool {
-    let reply = match request {
-        Ok(Request::Create(_)) => Error::NotSupported.reply(),
-        Ok(request) if index::dimensions(request.index()).is_none() => Error::NotFound.reply(),
-        Ok(request) => match Op::new(request) {
-            Ok(op) => {
-                aio::begin(op, Some(Waiter::new(conn)));
-                return true;
+    match request.and_then(|request| execute(conn, request)) {
+        Ok(None) => true,
+        Ok(Some(reply)) => conn.respond(&reply),
+        Err(e) => conn.respond(e.reply()),
+    }
+}
+
+fn execute(conn: Connection, request: Request<'_>) -> Result<Reply, Error> {
+    match request {
+        Request::Create(c) => {
+            // The config is the new map's value; its link event registers the index.
+            let mut config = index::config_of(&c)?;
+            config.extend_from_slice(b"\r\n");
+            let attr = engine::map_attr(c.maxcount, server::realtime(c.exptime));
+            let store = Store::of(conn)?;
+            if index::get(c.index).is_some() {
+                if store.exists(c.index)? {
+                    return Err(Error::Exists);
+                }
+                // Dropped or expired, with its unlink not yet run on its lane; waits out the commands
+                // in it.
+                index::retire(c.index);
             }
-            Err(e) => e.reply(),
-        },
-        Err(e) => e.reply(),
+            event::offer(conn, Expect::Create, || {
+                store.create_map(c.index, &config, attr)
+            });
+            Ok(None)
+        }
+        Request::Upsert(u) => {
+            let (graph, store) = open(conn, u.index)?;
+            let _entered = graph.enter().ok_or(Error::NotFound)?;
+            if !fits(&u.vector, graph.layout()) {
+                return Err(Error::NotFound);
+            }
+            let value = element::join(&u.meta, &u.vector.to_bytes())?;
+            event::offer(conn, Expect::Upsert, || {
+                store.upsert_elem(u.index, u.vkey, &value)
+            });
+            Ok(None)
+        }
+        Request::SetMeta(s) => {
+            let (graph, store) = open(conn, s.index)?;
+            let _entered = graph.enter().ok_or(Error::NotFound)?;
+            let (dim, kind) = graph.layout();
+            // The replace fills the vector from the element it replaces, as the engine holds it.
+            let value = element::with_blank_vector(&s.meta, quant::byte_len(dim, kind))?;
+            event::offer(conn, Expect::SetMeta, || {
+                store.update_elem(s.index, s.vkey, &value)
+            });
+            Ok(None)
+        }
+        Request::GetMeta { index, vkey } => {
+            let (_, store) = open(conn, index)?;
+            let value = store.get_elem(index, vkey)?;
+            let (doc, _) = element::split(&value).ok_or(Error::Internal)?;
+            let json = bson::to_json(doc)?;
+            let reply = format!("META {vkey} {}\r\n{json}\r\n", json.len());
+            Ok(Some(Cow::Owned(reply.into_bytes())))
+        }
+        Request::Delete { index, vkey } => {
+            let (_, store) = open(conn, index)?;
+            event::offer(conn, Expect::Delete, || store.delete_elem(index, vkey));
+            Ok(None)
+        }
+        Request::Drop { index } => {
+            let (_, store) = open(conn, index)?;
+            event::offer(conn, Expect::Drop, || store.remove(index));
+            Ok(None)
+        }
+        Request::Search(mut search) => {
+            let (graph, store) = open(conn, search.index)?;
+            let entered = graph.enter().ok_or(Error::NotFound)?;
+            let (dim, kind) = graph.layout();
+            if let Source::Vkey(vkey) = search.source {
+                let value = store.get_elem(search.index, vkey)?;
+                let (_, bytes) = element::split(&value).ok_or(Error::Internal)?;
+                search.vector = Vector::from_bytes(bytes, kind).ok_or(Error::Internal)?;
+            } else if !fits(&search.vector, (dim, kind)) {
+                return Err(Error::NotFound);
+            }
+            drop(entered);
+            aio::begin(Op::new(Request::Search(search))?, Some(Waiter::new(conn)));
+            Ok(None)
+        }
+    }
+}
+
+/// The index at `index`, and the engine to run on. Without such an index, a key the engine has
+/// there is of another type.
+fn open(conn: Connection, index: &str) -> Result<(Arc<Graph>, Store), Error> {
+    let Some(graph) = index::get(index) else {
+        let other = Store::of(conn).and_then(|store| store.exists(index));
+        return Err(if other == Ok(true) {
+            Error::TypeMismatch
+        } else {
+            Error::NotFound
+        });
     };
-    conn.respond(reply)
+    Ok((graph, Store::of(conn)?))
+}
+
+/// Whether `vector`, read as the body came in, is one of an index of `layout`: a create may have
+/// come since, under the name, with another or none, leaving nothing read.
+fn fits(vector: &Vector, (dim, kind): (usize, ScalarKind)) -> bool {
+    let (of, len) = match vector {
+        Vector::F32(v) => (ScalarKind::F32, v.len() * 4),
+        Vector::F16(v) => (ScalarKind::F16, v.len() * 2),
+        Vector::I8(v) => (ScalarKind::I8, v.len()),
+        Vector::B1(v) => (ScalarKind::B1, v.len()),
+    };
+    of == kind && len == quant::byte_len(dim, kind)
 }
 
 /// `bytes` as a vector of `index`, as many finite `f32`s as it has dimensions, in its scalar kind:

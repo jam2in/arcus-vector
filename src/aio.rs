@@ -21,7 +21,7 @@ pub struct Waiter {
 impl Waiter {
     pub fn new(conn: Connection) -> Self {
         let reply = Arc::new(OnceLock::new());
-        // SAFETY: its callers, `cmd::run` and `event::offer`, run in `execute`.
+        // SAFETY: its callers, `cmd::execute` and `event::offer`, run in `execute`.
         let wait = unsafe { conn.wait_for_io() };
         let data = Arc::into_raw(Arc::clone(&reply));
         // SAFETY: as above, and `wake` takes back the count `data` holds.

@@ -20,13 +20,15 @@ static INDEXES: LazyLock<RwLock<HashMap<String, Entry>>> = LazyLock::new(RwLock:
 
 pub fn create(name: &str, map: usize, config: &[u8]) -> Result<(), Error> {
     let options = options_of(config).ok_or(Error::TypeMismatch)?;
+    let taken =
+        |indexes: &HashMap<String, Entry>| indexes.get(name).is_some_and(|e| e.graph.is_open());
     // A native index reserves per-thread buffers up front; skip building one for a taken name.
-    if read().contains_key(name) {
+    if taken(&read()) {
         return Err(Error::Exists);
     }
     let graph = Arc::new(Graph::new(&options)?);
     let mut indexes = write();
-    if indexes.contains_key(name) {
+    if taken(&indexes) {
         return Err(Error::Exists);
     }
     indexes.insert(name.to_owned(), Entry { map, graph });
@@ -35,14 +37,30 @@ pub fn create(name: &str, map: usize, config: &[u8]) -> Result<(), Error> {
 
 /// Takes out the index at `name` if `map` holds it.
 pub fn remove(name: &str, map: usize) -> bool {
+    // Closed outside the registry's lock, which a command in the graph may yet take.
+    let Some(graph) = of_map(name, map) else {
+        return false;
+    };
+    graph.close();
     let mut indexes = write();
     let held = indexes.get(name).is_some_and(|entry| entry.map == map);
     held && indexes.remove(name).is_some()
 }
 
+/// Closes the index at `name` to commands, as its Map is gone; its events still find it until its
+/// drop.
+pub fn retire(name: &str) {
+    let graph = read().get(name).map(|entry| Arc::clone(&entry.graph));
+    if let Some(graph) = graph {
+        graph.close();
+    }
+}
+
 /// The index at `name`, for a command.
 pub fn get(name: &str) -> Option<Arc<Graph>> {
-    read().get(name).map(|entry| Arc::clone(&entry.graph))
+    let indexes = read();
+    let entry = indexes.get(name).filter(|entry| entry.graph.is_open())?;
+    Some(Arc::clone(&entry.graph))
 }
 
 /// The index at `name` if `map` holds it, for an event of that Map.
@@ -50,10 +68,6 @@ pub fn of_map(name: &str, map: usize) -> Option<Arc<Graph>> {
     let indexes = read();
     let entry = indexes.get(name).filter(|entry| entry.map == map)?;
     Some(Arc::clone(&entry.graph))
-}
-
-pub fn dimensions(name: &str) -> Option<usize> {
-    get(name).map(|graph| graph.dimensions())
 }
 
 /// The dimensions and scalar kind of the index at `name`.
@@ -91,10 +105,6 @@ fn options_of(config: &[u8]) -> Option<IndexOptions> {
 }
 
 /// The config `vop create` stores as its map's value.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "vop create does not store it on the engine yet")
-)]
 pub fn config_of(create: &Create<'_>) -> Result<Vec<u8>, Error> {
     let int = |n: usize| i32::try_from(n).map_err(|_| Error::BadCommandLine);
     bson::doc! {
@@ -215,6 +225,18 @@ mod tests {
         assert!(!remove("gone", 1));
         assert!(remove("gone", 0));
         assert!(!remove("gone", 0));
-        assert_eq!(dimensions("gone"), None);
+        assert!(get("gone").is_none());
+    }
+
+    #[test]
+    fn a_retired_index_is_hidden_from_commands_until_its_drop() {
+        let config = test_config(4, "cos", "f32");
+        assert_eq!(create("retired", 1, &config), Ok(()));
+        retire("retired");
+        assert!(get("retired").is_none());
+        assert!(of_map("retired", 1).is_some());
+        assert!(remove("retired", 1));
+        assert_eq!(create("retired", 2, &config), Ok(()));
+        assert!(get("retired").is_some());
     }
 }

@@ -1,11 +1,3 @@
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the commands that fail with the rest are not in yet"
-    )
-)]
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     BadCommandLine,

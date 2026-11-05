@@ -6,8 +6,9 @@ use std::sync::OnceLock;
 use super::ffi::{
     AIO_CALLBACK, ENGINE_ERROR_CODE, ENGINE_ERROR_CODE_ENGINE_SUCCESS, ENGINE_EVENT_TYPE,
     ENGINE_HANDLE, EVENT_CALLBACK, EXTENSION_ASCII_PROTOCOL_DESCRIPTOR,
-    EXTENSION_LOGGER_DESCRIPTOR, SERVER_HANDLE_V1, VERSION, engine_interface_v1, extension_type_t,
-    extension_type_t_EXTENSION_ASCII_PROTOCOL, rel_time_t, time_t,
+    EXTENSION_LOG_LEVEL_EXTENSION_LOG_WARNING, EXTENSION_LOGGER_DESCRIPTOR, SERVER_HANDLE_V1,
+    VERSION, engine_interface_v1, extension_type_t, extension_type_t_EXTENSION_ASCII_PROTOCOL,
+    rel_time_t, time_t,
 };
 use crate::nread::Pending;
 
@@ -29,7 +30,6 @@ pub type EventCallback = unsafe extern "C" fn(
     cb_data: *const c_void,
 );
 
-#[expect(dead_code, reason = "the commands that use the rest are not in yet")]
 struct Api {
     get_server_api: GetServerApi,
     get_logger: unsafe extern "C" fn() -> *mut EXTENSION_LOGGER_DESCRIPTOR,
@@ -60,6 +60,12 @@ pub fn set(get_server_api: GetServerApi) -> Result<(), &'static str> {
     // A second `-X` of this library fails here, before its descriptor is registered twice.
     API.set(Api::new(server, get_server_api)?)
         .map_err(|_| "already loaded")
+}
+
+/// `exptime` as the engine keeps it: memcached's rule, where a small value is seconds from now.
+pub fn realtime(exptime: u32) -> u32 {
+    // SAFETY: the server's own function, which only reads its clock.
+    unsafe { (api().realtime)(time_t::from(exptime)) }
 }
 
 /// The loaded engine; `None` before the server loads it.
@@ -188,6 +194,18 @@ impl Connection {
         // SAFETY: `new`'s caller guaranteed the connection takes a reply through `handler` now;
         // `reply` outlives the call.
         unsafe { handler(self.cookie, len, reply.as_ptr().cast()) }
+    }
+
+    /// Logs `message` as a warning about the connection.
+    pub fn warn(self, message: &CStr) {
+        // SAFETY: the server's own function; it returns its logger, alive for the process.
+        let Some(log) = (unsafe { (api().get_logger)().as_ref() }).and_then(|logger| logger.log)
+        else {
+            return;
+        };
+        let level = EXTENSION_LOG_LEVEL_EXTENSION_LOG_WARNING;
+        // SAFETY: `%s` takes the one C string that follows, which outlives the call.
+        unsafe { log(level, self.cookie, c"%s\n".as_ptr(), message.as_ptr()) };
     }
 
     /// Keeps `pending` on the connection until [`Connection::take_kept`]; gives it back if the

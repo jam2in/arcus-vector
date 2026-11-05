@@ -6,7 +6,7 @@ use crate::aio::{self, Op, Waiter};
 use crate::error::Error;
 use crate::guard;
 use crate::index;
-use crate::memcached::engine::Item;
+use crate::memcached::engine::{Elem, Item};
 use crate::memcached::ffi::{
     ENGINE_EVENT_TYPE, ENGINE_EVENT_TYPE_ON_EVENT_ITEM, event_data_t,
     event_type_t_EVENT_ELEM_DELETE as EVENT_ELEM_DELETE,
@@ -19,7 +19,6 @@ use crate::memcached::server::{self, Connection};
 
 /// The event a command's write raises, which its lane answers the command from.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[expect(dead_code, reason = "the write commands are not in yet")]
 pub enum Expect {
     Create,
     Drop,
@@ -58,10 +57,6 @@ thread_local! {
 
 /// Runs `write`, whose `expect` event hands `conn` to the lane that answers it. A write that fails,
 /// or raises no such event, is answered here.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the write commands are not in yet")
-)]
 pub fn offer(conn: Connection, expect: Expect, write: impl FnOnce() -> Result<(), Error>) {
     struct Clear;
     impl Drop for Clear {
@@ -75,11 +70,12 @@ pub fn offer(conn: Connection, expect: Expect, write: impl FnOnce() -> Result<()
         waiter: Waiter::new(conn),
     }));
     let written = write();
-    // Unclaimed after a write that did not fail, the waiter drops, answering an internal error.
-    if let Some(Pending { waiter, .. }) = PENDING.take()
-        && let Err(e) = written
-    {
-        waiter.answer(Cow::Borrowed(e.reply()));
+    if let Some(Pending { waiter, .. }) = PENDING.take() {
+        match written {
+            Err(e) => waiter.answer(Cow::Borrowed(e.reply())),
+            // The waiter drops, answering an internal error.
+            Ok(()) => conn.warn(c"arcus-vector: a write raised no event to reply from"),
+        }
     }
 }
 
@@ -167,6 +163,13 @@ unsafe extern "C" fn on_item_event(
             };
             // None for a change from replication or replay, or one the write did not ask for.
             let (op, waiter) = claim(op);
+            if let Op::SetMeta { old, new, .. } = &op
+                && let (Ok(old), Ok(mut new)) = (Elem::new(*old), Elem::new(*new))
+            {
+                // SAFETY: the engine holds the Map's lock through the callback, which runs before
+                // the change is logged, and no lane has the new element yet.
+                unsafe { new.fill_vector(&old) };
+            }
             let holds = matches!(
                 op,
                 Op::Insert { .. } | Op::Replace { .. } | Op::SetMeta { .. }

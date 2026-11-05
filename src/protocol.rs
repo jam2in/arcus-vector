@@ -1,11 +1,3 @@
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the parsed fields are read by the commands built on this parser"
-    )
-)]
-
 mod tokens;
 
 use std::ops::RangeInclusive;
