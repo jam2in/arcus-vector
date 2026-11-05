@@ -3,6 +3,7 @@ use std::os::raw::c_char;
 use crate::bson;
 use crate::cmd;
 use crate::error::Error;
+use crate::filter::Filter;
 use crate::index;
 use crate::memcached::server::Connection;
 use crate::protocol::{self, MAX_BODY_BYTES, MAX_ELEMENT_BYTES, Request, Tokens};
@@ -53,6 +54,9 @@ impl Pending {
         let bytes = cut(vector)?;
         let extra = cut(extra)?;
         match &mut request {
+            Request::Search(s) if s.filter_bytes.is_some() => {
+                s.filter = Some(Filter::parse(extra)?);
+            }
             Request::Upsert(u) if u.meta_bytes.is_some() => u.meta = bson::from_json(extra)?,
             Request::SetMeta(s) => s.meta = bson::from_json(extra)?,
             _ => {}

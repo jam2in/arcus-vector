@@ -15,6 +15,7 @@ use usearch::{MetricKind, ScalarKind};
 
 use crate::bson;
 use crate::error::Error;
+use crate::filter::Filter;
 use crate::memcached::ffi::MAX_FIELD_LENG;
 use crate::quant::Vector;
 
@@ -151,6 +152,8 @@ pub struct Search<'a> {
     pub vector: Vector,
     pub k: usize,
     pub filter_bytes: Option<usize>,
+    /// Parsed from the body, unset until it is read.
+    pub filter: Option<Filter>,
     pub with_meta: bool,
 }
 
@@ -437,6 +440,7 @@ fn search<'a>(args: &mut Args<'_, 'a>) -> Result<Search<'a>, Error> {
         vector: Vector::default(),
         k: in_range(k, &(1..=MAX_RESULTS))?,
         filter_bytes,
+        filter: None,
         with_meta,
     })
 }

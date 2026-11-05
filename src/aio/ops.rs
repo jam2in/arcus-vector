@@ -5,6 +5,7 @@ use super::pool::Op;
 use super::sweeper;
 use crate::bson;
 use crate::error::Error;
+use crate::filter::Filter;
 use crate::index::{self, Graph};
 use crate::memcached::engine::Elem;
 use crate::quant::Vector;
@@ -15,8 +16,9 @@ pub fn run(op: &Op) -> Result<Cow<'static, [u8]>, Error> {
             index,
             vector,
             k,
+            filter,
             with_meta,
-        } => search(index, vector, *k, *with_meta).map(Cow::Owned),
+        } => search(index, vector, *k, filter.as_ref(), *with_meta).map(Cow::Owned),
         Op::Insert { index, map, key } => {
             insert(of_map(index, *map), *key).map(|()| Cow::Borrowed(&b"STORED\r\n"[..]))
         }
@@ -88,9 +90,16 @@ fn delete(graph: Result<Arc<Graph>, Error>, key: usize) -> Result<(), Error> {
     removed.map(|_| ())
 }
 
-fn search(index: &str, vector: &Vector, k: usize, with_meta: bool) -> Result<Vec<u8>, Error> {
+fn search(
+    index: &str,
+    vector: &Vector,
+    k: usize,
+    filter: Option<&Filter>,
+    with_meta: bool,
+) -> Result<Vec<u8>, Error> {
     let _reading = sweeper::block().ok_or(Error::Internal)?;
-    graph(index)?.search_with(vector, k, |found| {
+    let accept = filter.map(|filter| move |key| matches(filter, key));
+    graph(index)?.search_with(vector, k, accept, |found| {
         let mut out = Vec::new();
         put(&mut out, format!("VECTORS {}\r\n", found.len()).as_bytes())?;
         for &(key, score) in found {
@@ -107,6 +116,15 @@ fn search(index: &str, vector: &Vector, k: usize, with_meta: bool) -> Result<Vec
         put(&mut out, b"END\r\n")?;
         Ok(out)
     })
+}
+
+/// Whether the element at `key`, which the reading keeps, has metadata `filter` takes.
+fn matches(filter: &Filter, key: u64) -> bool {
+    let elem = usize::try_from(key)
+        .ok()
+        .and_then(|key| Elem::new(key).ok());
+    elem.and_then(|elem| elem.meta().map(|doc| filter.matches(doc)))
+        .unwrap_or(false)
 }
 
 /// The shortest text that reads back as `score`, with an exponent where plain digits run long.
