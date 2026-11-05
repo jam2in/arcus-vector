@@ -229,11 +229,14 @@ mod tests {
     }
 
     #[test]
-    fn well_formed_lines_are_not_supported_yet() {
-        assert_eq!(reply_to("vop create unsupported 2 0"), "NOT_SUPPORTED\r\n");
+    fn a_command_without_the_engine_is_an_internal_error() {
+        assert_eq!(
+            reply_to("vop create noengine 2 0"),
+            "SERVER_ERROR internal\r\n"
+        );
         let config = crate::index::test_config(2, "cos", "f32");
-        assert_eq!(crate::index::create_with("unsupported", 0, &config), Ok(()));
-        assert_eq!(reply_to("vop drop unsupported"), "NOT_SUPPORTED\r\n");
+        assert_eq!(crate::index::create_with("noengine", 0, &config), Ok(()));
+        assert_eq!(reply_to("vop drop noengine"), "SERVER_ERROR internal\r\n");
     }
 
     #[test]

@@ -1,5 +1,3 @@
-#![expect(dead_code, reason = "the commands that use the engine are not in yet")]
-
 #[rustfmt::skip]
 mod fns;
 

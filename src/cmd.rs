@@ -1,25 +1,100 @@
+use std::borrow::Cow;
+
+use usearch::ScalarKind;
+
 use crate::aio::{self, Op};
+use crate::bson;
+use crate::element;
 use crate::error::Error;
+use crate::event::{self, Command};
 use crate::index;
-use crate::memcached::server::Connection;
-use crate::protocol::{Format, Request};
+use crate::memcached::engine::{self, Store};
+use crate::memcached::server::{self, Connection};
+use crate::protocol::{Format, Request, Source};
 use crate::quant::{self, Vector};
+
+/// A reply now, or `None` once a lane has the connection to reply to.
+type Reply = Option<Cow<'static, [u8]>>;
 
 /// Runs `request` on `conn`, replying now or once a lane is done.
 pub fn run(conn: Connection, request: Result<Request<'_>, Error>) -> bool {
-    let reply = match request {
-        Ok(Request::Create(_)) => Error::NotSupported.reply(),
-        Ok(request) if index::dimensions(request.index()).is_none() => Error::NotFound.reply(),
-        Ok(request) => match Op::new(request) {
-            Ok(op) => {
-                aio::begin(op, Some(conn));
-                return true;
+    match request.and_then(|request| execute(conn, request)) {
+        Ok(None) => true,
+        Ok(Some(reply)) => conn.respond(&reply),
+        Err(e) => conn.respond(e.reply()),
+    }
+}
+
+fn execute(conn: Connection, request: Request<'_>) -> Result<Reply, Error> {
+    match request {
+        Request::Create(c) => {
+            if index::get(c.index).is_some() {
+                return Err(Error::Exists);
             }
-            Err(e) => e.reply(),
-        },
-        Err(e) => e.reply(),
-    };
-    conn.respond(reply)
+            // The config is the new map's value; its link event registers the index.
+            let mut config = index::config_of(&c)?;
+            config.extend_from_slice(b"\r\n");
+            let attr = engine::map_attr(c.maxcount, server::realtime(c.exptime));
+            let store = Store::of(conn)?;
+            event::offer(conn, Command::Write, || {
+                store.create_map(c.index, &config, attr)
+            })?;
+            Ok(None)
+        }
+        Request::Upsert(u) => {
+            let (_, store) = open(conn, u.index)?;
+            let value = element::join(&u.meta, &u.vector.to_bytes())?;
+            event::offer(conn, Command::Write, || {
+                store.upsert_elem(u.index, u.vkey, &value)
+            })?;
+            Ok(None)
+        }
+        Request::SetMeta(s) => {
+            let (_, store) = open(conn, s.index)?;
+            let old = store.get_elem(s.index, s.vkey)?;
+            let (_, vector) = element::split(&old).ok_or(Error::Internal)?;
+            let value = element::join(&s.meta, vector)?;
+            event::offer(conn, Command::SetMeta, || {
+                store.update_elem(s.index, s.vkey, &value)
+            })?;
+            Ok(None)
+        }
+        Request::GetMeta { index, vkey } => {
+            let (_, store) = open(conn, index)?;
+            let value = store.get_elem(index, vkey)?;
+            let (doc, _) = element::split(&value).ok_or(Error::Internal)?;
+            let json = bson::to_json(doc)?;
+            let reply = format!("META {vkey} {}\r\n{json}\r\n", json.len());
+            Ok(Some(Cow::Owned(reply.into_bytes())))
+        }
+        Request::Delete { index, vkey } => {
+            let (_, store) = open(conn, index)?;
+            event::offer(conn, Command::Write, || store.delete_elem(index, vkey))?;
+            Ok(None)
+        }
+        Request::Drop { index } => {
+            let (_, store) = open(conn, index)?;
+            event::offer(conn, Command::Write, || store.remove(index))?;
+            Ok(None)
+        }
+        Request::Search(mut search) => {
+            let (kind, store) = open(conn, search.index)?;
+            if let Source::Vkey(vkey) = search.source {
+                let value = store.get_elem(search.index, vkey)?;
+                let (_, bytes) = element::split(&value).ok_or(Error::Internal)?;
+                search.vector = Vector::from_bytes(bytes, kind).ok_or(Error::Internal)?;
+            }
+            aio::begin(Op::new(Request::Search(search))?, Some(conn));
+            Ok(None)
+        }
+    }
+}
+
+/// The scalar kind of the index at `index`, and the engine to run on; `NOT_FOUND` before the
+/// engine if there is no such index.
+fn open(conn: Connection, index: &str) -> Result<(ScalarKind, Store), Error> {
+    let (_, kind) = index::layout(index).ok_or(Error::NotFound)?;
+    Ok((kind, Store::of(conn)?))
 }
 
 /// `bytes` as a vector of `index`, as many `f32`s as it has dimensions, in its scalar kind: `bin`

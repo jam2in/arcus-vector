@@ -4,6 +4,7 @@
 use bson::RawDocument;
 use usearch::ScalarKind;
 
+use crate::error::Error;
 use crate::memcached::engine::Elem;
 use crate::quant::Vector;
 
@@ -27,7 +28,19 @@ impl Elem {
     }
 }
 
-fn split(value: &[u8]) -> Option<(&[u8], &[u8])> {
+/// An element's value from its metadata document and vector bytes.
+pub fn join(meta: &[u8], vector: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut value = Vec::new();
+    value
+        .try_reserve_exact(meta.len() + vector.len())
+        .map_err(|_| Error::OutOfMemory)?;
+    value.extend_from_slice(meta);
+    value.extend_from_slice(vector);
+    Ok(value)
+}
+
+/// An element's value as its metadata document and vector bytes.
+pub fn split(value: &[u8]) -> Option<(&[u8], &[u8])> {
     let len = u32::from_le_bytes(*value.first_chunk()?);
     value.split_at_checked(usize::try_from(len).ok()?)
 }
@@ -43,5 +56,6 @@ mod tests {
         assert_eq!(split(&value), Some((&doc[..], &[1, 2, 3][..])));
         assert_eq!(split(&[9, 0, 0, 0, 0]), None);
         assert_eq!(split(&[1, 0]), None);
+        assert_eq!(join(&doc, &[1, 2, 3]), Ok(value));
     }
 }
