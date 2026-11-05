@@ -49,13 +49,13 @@ pub extern "C" fn memcached_extensions_initialize(
 fn initialize(get_server_api: GET_SERVER_API) -> Result<(), &'static str> {
     let get_server_api = get_server_api.ok_or("the server passed no get_server_api")?;
     memcached::server::set(get_server_api)?;
-    if !aio::start() {
-        return Err("the lane threads could not start");
-    }
     event::install();
     // SAFETY: `DESCRIPTOR` is static and only the core touches it from here on (it writes `next`).
     if !unsafe { memcached::server::register_ascii(&raw mut ascii::DESCRIPTOR) } {
         return Err("the server refused the ASCII protocol extension");
+    }
+    if !aio::start() {
+        return Err("the lane threads could not start");
     }
     Ok(())
 }

@@ -3,7 +3,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::os::raw::c_int;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Barrier};
 
@@ -30,6 +30,8 @@ pub enum Op {
     Delete { index: String, map: usize, key: usize },
     Create { index: String, map: usize, config: Vec<u8> },
     Drop { index: String, map: usize },
+    /// Wakes an idle lane to see it is closed.
+    Shutdown,
 }
 
 impl Op {
@@ -54,16 +56,18 @@ impl Op {
     }
 
     /// A search goes to the least busy lane; a change goes to its index's lane, so that changes to
-    /// one index run in the order the engine made them.
-    fn lane(&self) -> &'static Lane {
+    /// one index run in the order the engine made them. A shutdown goes to every lane, from
+    /// [`close`].
+    fn lane(&self) -> Option<&'static Lane> {
         match self {
-            Self::Search { .. } => idlest(),
+            Self::Search { .. } => Some(idlest()),
             Self::Insert { index, .. }
             | Self::Replace { index, .. }
             | Self::SetMeta { index, .. }
             | Self::Delete { index, .. }
             | Self::Create { index, .. }
-            | Self::Drop { index, .. } => lane_of(index),
+            | Self::Drop { index, .. } => Some(lane_of(index)),
+            Self::Shutdown => None,
         }
     }
 }
@@ -81,6 +85,7 @@ struct Lane {
     tasks: Sender<Task>,
     /// Queued plus running jobs, to pick the least busy lane.
     load: AtomicUsize,
+    closed: AtomicBool,
 }
 
 // Set at load, and again in the child of `-d`'s fork, where the lanes made at load are gone.
@@ -92,6 +97,24 @@ pub fn start() -> bool {
     spawn() && unsafe { pthread_atfork(None, None, Some(restart)) == 0 }
 }
 
+/// Has each lane end once the job it runs is done; the queued ones drop unrun, waking their
+/// connections to an internal error. Does not wait for the lanes to end.
+#[expect(dead_code, reason = "nothing closes the lanes yet")]
+pub fn shutdown() {
+    // SAFETY: a non-null `POOL` is a leaked array, never freed.
+    if let Some(lanes) = unsafe { POOL.load(Ordering::Acquire).as_ref() } {
+        lanes.iter().for_each(close);
+    }
+}
+
+fn close(lane: &Lane) {
+    lane.closed.store(true, Ordering::Release);
+    let _ = lane.tasks.send(Task {
+        op: Op::Shutdown,
+        waiter: None,
+    });
+}
+
 /// `false` if a thread could not be made.
 fn spawn() -> bool {
     let mut receivers = Vec::with_capacity(NUM_LANES);
@@ -101,6 +124,7 @@ fn spawn() -> bool {
         Lane {
             tasks,
             load: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
         }
     })));
     // A fork must not catch a lane mid-start, holding a global lock (allocator, TLS) the child
@@ -180,9 +204,14 @@ fn lane_of(index: &str) -> &'static Lane {
 
 /// Runs `op` on its lane, which then answers `waiter`.
 pub fn submit(op: Op, waiter: Option<Waiter>) -> bool {
-    send(op.lane(), Task { op, waiter })
+    let Some(lane) = op.lane() else {
+        return false;
+    };
+    send(lane, Task { op, waiter })
 }
 
+/// `false` only if the lane has ended; the task then drops, answering its connection an internal
+/// error.
 fn send(lane: &Lane, task: Task) -> bool {
     lane.load.fetch_add(1, Ordering::Relaxed);
     match lane.tasks.send(task) {
@@ -196,6 +225,9 @@ fn send(lane: &Lane, task: Task) -> bool {
 
 fn run(lane: &Lane, tasks: &Receiver<Task>) {
     for task in tasks {
+        if lane.closed.load(Ordering::Acquire) {
+            break;
+        }
         // A panicking job must not kill the lane, or its later jobs would never run.
         let _ = catch_unwind(AssertUnwindSafe(|| task.run()));
         lane.load.fetch_sub(1, Ordering::Relaxed);
@@ -230,6 +262,50 @@ mod tests {
             .map(|_| rx.recv_timeout(Duration::from_secs(10)).unwrap())
             .collect();
         assert_eq!(got, (0..100).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_closed_lane_ends_and_drops_the_queued_jobs_unrun() {
+        fake::install();
+        let (tasks, rx) = channel();
+        let lane: &'static Lane = Box::leak(Box::new(Lane {
+            tasks,
+            load: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
+        }));
+        let (tx, woken) = channel();
+        let conns: Vec<_> = (0..5).map(|id| fake::Conn::new(id, &tx)).collect();
+        for conn in &conns {
+            let task = Task {
+                op: Op::Search {
+                    index: "idx".into(),
+                    vector: Vector::default(),
+                    k: 1,
+                    with_meta: false,
+                },
+                waiter: Some(Waiter::new(conn.connection())),
+            };
+            assert!(send(lane, task));
+        }
+        close(lane);
+        std::thread::spawn(move || run(lane, &rx)).join().unwrap();
+        let mut got: Vec<usize> = woken.try_iter().collect();
+        got.sort_unstable();
+        assert_eq!(got, (0..5).collect::<Vec<_>>());
+        for conn in &conns {
+            assert!(conn.run_callback());
+            assert_eq!(conn.reply(), Error::Internal.reply());
+        }
+        assert!(!send(
+            lane,
+            Task {
+                op: Op::Drop {
+                    index: "idx".into(),
+                    map: 0,
+                },
+                waiter: None,
+            }
+        ));
     }
 
     #[test]

@@ -40,6 +40,8 @@ pub fn run(op: &Op) -> Result<Cow<'static, [u8]>, Error> {
         Op::Drop { index, map } => index::remove(index, *map)
             .then_some(Cow::Borrowed(&b"DROPPED\r\n"[..]))
             .ok_or(Error::NotFound),
+        // A lane ends on it before it runs.
+        Op::Shutdown => Err(Error::Internal),
     }
 }
 
