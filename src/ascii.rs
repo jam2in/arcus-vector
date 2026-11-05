@@ -320,6 +320,14 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_filter_is_a_bad_value() {
+        assert_eq!(
+            reply_to_body("vop search idx vkey k1 3 filter 3", b"a =\r\n"),
+            Ok("CLIENT_ERROR bad value\r\n".into())
+        );
+    }
+
+    #[test]
     fn a_segment_without_its_crlf_is_a_bad_data_chunk() {
         assert_eq!(
             reply_to_body("vop setmeta idx k1 5", b"hello!!"),

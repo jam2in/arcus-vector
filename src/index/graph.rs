@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{PoisonError, RwLock, RwLockReadGuard};
 
 use numkong::f16;
-use usearch::{Index, IndexOptions, ScalarKind, b1x8};
+use usearch::{Index, IndexOptions, ScalarKind, VectorType, b1x8};
 
 use crate::aio::NUM_LANES;
 use crate::error::Error;
@@ -77,11 +77,12 @@ impl Graph {
         Ok(self.read().rename(from, to).map_err(|_| Error::Internal)? > 0)
     }
 
-    /// Runs `f` on what a search finds.
+    /// Runs `f` on what a search finds, among the keys `accept` takes if given.
     pub fn search_with<T>(
         &self,
         query: &Vector,
         count: usize,
+        accept: Option<impl Fn(u64) -> bool>,
         f: impl FnOnce(&[(u64, f32)]) -> Result<T, Error>,
     ) -> Result<T, Error> {
         if !self.populated.load(Ordering::Acquire) {
@@ -89,14 +90,13 @@ impl Graph {
         }
         let index = self.read();
         let count = count.min(index.size().max(1));
-        let matches = match query {
-            Vector::F32(q) => index.search(q, count),
-            Vector::F16(q) => index.search(as_usearch_f16(q), count),
-            Vector::I8(q) => index.search(q, count),
-            Vector::B1(q) => index.search(b1x8::from_u8s(q), count),
-        }
-        .map_err(|_| Error::Internal)?;
-        let found: Vec<(u64, f32)> = matches.keys.into_iter().zip(matches.distances).collect();
+        let accept = accept.as_ref();
+        let found = match query {
+            Vector::F32(q) => find(&index, q, count, accept),
+            Vector::F16(q) => find(&index, as_usearch_f16(q), count, accept),
+            Vector::I8(q) => find(&index, q, count, accept),
+            Vector::B1(q) => find(&index, b1x8::from_u8s(q), count, accept),
+        }?;
         f(&found)
     }
 
@@ -122,6 +122,23 @@ impl Graph {
     }
 }
 
+fn find<T: VectorType>(
+    index: &Index,
+    query: &[T],
+    count: usize,
+    accept: Option<&impl Fn(u64) -> bool>,
+) -> Result<Vec<(u64, f32)>, Error> {
+    let matches = match accept {
+        None => index.search(query, count),
+        // usearch calls it from C++, which a panic must not unwind into.
+        Some(accept) => {
+            index.filtered_search(query, count, |key| crate::guard(|| false, || accept(key)))
+        }
+    }
+    .map_err(|_| Error::Internal)?;
+    Ok(matches.keys.into_iter().zip(matches.distances).collect())
+}
+
 fn as_usearch_f16(v: &[f16]) -> &[usearch::f16] {
     // SAFETY: both are `repr(transparent)` over 16 bits, so the slices share their layout.
     unsafe { std::slice::from_raw_parts(v.as_ptr().cast(), v.len()) }
@@ -135,7 +152,9 @@ mod tests {
     use crate::quant;
 
     fn search(g: &Graph, query: &Vector, count: usize) -> Result<Vec<(u64, f32)>, Error> {
-        g.search_with(query, count, |found| Ok(found.to_vec()))
+        g.search_with(query, count, None::<fn(u64) -> bool>, |found| {
+            Ok(found.to_vec())
+        })
     }
 
     fn graph(dim: usize, kind: ScalarKind) -> Graph {
@@ -188,6 +207,33 @@ mod tests {
             usize::MAX,
         );
         assert_eq!(found.map(|f| f.len()), Ok(1));
+    }
+
+    #[test]
+    fn a_filtered_search_finds_only_what_it_accepts() {
+        let g = graph(4, ScalarKind::F32);
+        for key in 0..10u64 {
+            let v = vector(&[key as f32, 1.0, 0.0, 0.0], ScalarKind::F32);
+            g.add(key, &v).unwrap();
+        }
+        let query = vector(&[1.0, 1.0, 0.0, 0.0], ScalarKind::F32);
+        let even = |key: u64| key.is_multiple_of(2);
+        let keys = g.search_with(&query, 3, Some(even), |found| {
+            Ok(found.iter().map(|&(key, _)| key).collect::<Vec<_>>())
+        });
+        let keys = keys.unwrap();
+        assert_eq!(keys.len(), 3);
+        assert!(keys.iter().all(|&key| even(key)), "{keys:?}");
+    }
+
+    #[test]
+    fn a_panicking_filter_rejects_rather_than_unwinding() {
+        let g = graph(4, ScalarKind::F32);
+        let v = vector(&[1.0, 0.0, 0.0, 0.0], ScalarKind::F32);
+        g.add(1, &v).unwrap();
+        let panics = |_: u64| -> bool { panic!("in a filter") };
+        let found = g.search_with(&v, 1, Some(panics), |found| Ok(found.len()));
+        assert_eq!(found, Ok(0));
     }
 
     #[test]
