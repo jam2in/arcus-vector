@@ -7,7 +7,7 @@ use std::sync::{Arc, OnceLock};
 use crate::error::Error;
 use crate::guard;
 use crate::memcached::server::{Connection, ResponseHandler};
-pub use pool::{Op, start};
+pub use pool::{NUM_LANES, Op, start};
 
 /// Hands `op` to a lane; `conn`, if any, is replied to from the io callback once it is done.
 pub fn begin(op: Op, conn: Option<Connection>) {
