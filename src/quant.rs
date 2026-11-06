@@ -22,10 +22,6 @@ impl Default for Vector {
 }
 
 impl Vector {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the write commands are not in yet")
-    )]
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
             Self::F32(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),

@@ -55,10 +55,6 @@ pub fn of_map(name: &str, map: usize) -> Option<Arc<Graph>> {
     Some(Arc::clone(&entry.graph))
 }
 
-pub fn dimensions(name: &str) -> Option<usize> {
-    get(name).map(|graph| graph.dimensions())
-}
-
 /// The dimensions and scalar kind of the index at `name`.
 pub fn layout(name: &str) -> Option<(usize, ScalarKind)> {
     get(name).map(|graph| (graph.dimensions(), graph.scalar_kind()))
@@ -94,10 +90,6 @@ fn options_of(config: &[u8]) -> Option<IndexOptions> {
 }
 
 /// The config `vop create` stores as its map's value.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "vop create does not store it on the engine yet")
-)]
 pub fn config_of(create: &Create<'_>) -> Result<Vec<u8>, Error> {
     let int = |n: usize| i32::try_from(n).map_err(|_| Error::BadCommandLine);
     bson::doc! {
@@ -224,6 +216,6 @@ mod tests {
         assert!(!remove("gone", 1));
         assert!(remove("gone", 0));
         assert!(!remove("gone", 0));
-        assert_eq!(dimensions("gone"), None);
+        assert!(get("gone").is_none());
     }
 }

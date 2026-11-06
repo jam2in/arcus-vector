@@ -2,6 +2,7 @@ use std::cell::Cell;
 use std::os::raw::c_void;
 
 use crate::aio::{self, Op};
+use crate::error::Error;
 use crate::guard;
 use crate::index;
 use crate::memcached::engine::Item;
@@ -18,10 +19,6 @@ use crate::memcached::server::{self, Connection};
 /// The command a write runs for, where a replace it raises answers as that command.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Command {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the write commands are not in yet")
-    )]
     Write,
     SetMeta,
 }
@@ -30,17 +27,12 @@ thread_local! {
     static CONN: Cell<Option<(Connection, Command)>> = const { Cell::new(None) };
 }
 
-/// Runs `write` so that the lane its event goes to replies to `conn`; gives `conn` back if no
-/// event took it.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the write commands are not in yet")
-)]
+/// Runs `write` so that the lane its event goes to replies to `conn`.
 pub fn offer<T>(
     conn: Connection,
     command: Command,
-    write: impl FnOnce() -> T,
-) -> (T, Option<Connection>) {
+    write: impl FnOnce() -> Result<T, Error>,
+) -> Result<T, Error> {
     struct Clear;
     impl Drop for Clear {
         fn drop(&mut self) {
@@ -50,7 +42,12 @@ pub fn offer<T>(
     let _clear = Clear;
     CONN.set(Some((conn, command)));
     let out = write();
-    (out, CONN.take().map(|(conn, _)| conn))
+    if out.is_ok()
+        && let Some((conn, _)) = CONN.take()
+    {
+        conn.warn(c"arcus-vector: a write raised no event to reply from");
+    }
+    out
 }
 
 fn op_of(ev: &event_data_t) -> Option<Op> {
@@ -200,10 +197,11 @@ mod tests {
         let (tx, rx) = channel();
         let conn = fake::Conn::new(12, &tx);
         // The tests have no engine to read the index from.
-        let ((), left) = offer(conn.connection(), Command::Write, || {
+        let written = offer(conn.connection(), Command::Write, || {
             raise(&mut event(EVENT_ELEM_INSERT, 8, 16, 0));
+            Ok(())
         });
-        assert!(left.is_some());
+        assert_eq!(written, Ok(()));
         assert!(CONN.take().is_none());
         assert!(rx.try_recv().is_err());
     }
