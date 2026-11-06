@@ -300,7 +300,7 @@ mod tests {
     #[test]
     fn a_body_is_read_then_answered() {
         assert_eq!(
-            reply_to_body("vop setmeta absent k1 5", b"hello\r\n"),
+            reply_to_body("vop setmeta absent k1 2", b"{}\r\n"),
             Ok("NOT_FOUND\r\n".into())
         );
         assert_eq!(
@@ -310,10 +310,31 @@ mod tests {
     }
 
     #[test]
+    fn a_vector_of_other_dimensions_is_a_bad_value() {
+        assert_eq!(reply_to("vop create twodim 2 0"), "CREATED\r\n");
+        assert_eq!(
+            reply_to_body("vop upsert twodim k1 4", b"abcd\r\n"),
+            Ok("CLIENT_ERROR bad value\r\n".into())
+        );
+        assert_eq!(
+            reply_to_body("vop upsert twodim k1 3 meta 2 str", b"{}\r\n1.5\r\n"),
+            Ok("CLIENT_ERROR bad value\r\n".into())
+        );
+    }
+
+    #[test]
     fn a_segment_without_its_crlf_is_a_bad_data_chunk() {
         assert_eq!(
             reply_to_body("vop setmeta idx k1 5", b"hello!!"),
             Ok("CLIENT_ERROR bad data chunk\r\n".into())
+        );
+    }
+
+    #[test]
+    fn metadata_that_is_not_a_json_object_is_a_bad_value() {
+        assert_eq!(
+            reply_to_body("vop setmeta idx k1 5", b"hello\r\n"),
+            Ok("CLIENT_ERROR bad value\r\n".into())
         );
     }
 
@@ -334,7 +355,7 @@ mod tests {
             assert_eq!(reply_to(line), "NOT_FOUND\r\n", "{line}");
         }
         assert_eq!(
-            reply_to_body("vop setmeta missing k1 5", b"hello\r\n"),
+            reply_to_body("vop setmeta missing k1 2", b"{}\r\n"),
             Ok("NOT_FOUND\r\n".into())
         );
     }
