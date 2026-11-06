@@ -10,6 +10,7 @@ use std::sync::{Arc, Barrier, OnceLock};
 use crate::error::Error;
 use crate::memcached::server::IoWaiter;
 use crate::protocol::{Request, Search, Source};
+use crate::quant::Vector;
 
 const NUM_LANES: usize = 32;
 
@@ -24,7 +25,7 @@ struct Task {
 
 #[expect(dead_code, reason = "no op runs yet")]
 pub enum Op {
-    Search { index: String, vector: Vec<f32> },
+    Search { index: String, vector: Vector },
     Upsert { index: String, vkey: String },
     SetMeta { index: String, vkey: String },
     Delete { index: String, vkey: String },
@@ -225,7 +226,7 @@ mod tests {
         for conn in &conns {
             let op = Op::Search {
                 index: "idx".into(),
-                vector: Vec::new(),
+                vector: Vector::default(),
             };
             let reply = Arc::default();
             // SAFETY: the fake server takes a wait on a `Conn` at any time.

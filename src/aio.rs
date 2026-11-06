@@ -51,6 +51,7 @@ mod tests {
     use crate::index;
     use crate::memcached::server::fake;
     use crate::protocol::{self, Tokens};
+    use crate::quant::Vector;
 
     #[test]
     fn begin_replies_from_the_io_callback_after_a_lane_notifies() {
@@ -66,7 +67,7 @@ mod tests {
         assert_eq!(index::create(&spec), Ok(()));
         let tokens = Tokens::from_line("vop search aio vector 3 16");
         let mut request = protocol::parse(tokens.words()).unwrap();
-        request.set_vector(vec![0.0; 4]);
+        request.set_vector(Vector::F32(vec![0.0; 4]));
         assert_eq!(begin(conn.connection(), request), Ok(()));
         assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), 7);
         assert!(conn.reply().is_empty());

@@ -9,6 +9,7 @@ mod index;
 mod memcached;
 mod nread;
 mod protocol;
+mod quant;
 
 use std::os::raw::c_char;
 use std::panic::{AssertUnwindSafe, catch_unwind};

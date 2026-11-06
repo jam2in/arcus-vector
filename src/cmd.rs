@@ -3,6 +3,7 @@ use crate::error::Error;
 use crate::index;
 use crate::memcached::server::Connection;
 use crate::protocol::{Format, Request};
+use crate::quant::{self, Vector};
 
 /// Runs `request` on `conn`, replying now or once a lane is done.
 pub fn run(conn: Connection, request: Result<Request<'_>, Error>) -> bool {
@@ -21,11 +22,11 @@ pub fn run(conn: Connection, request: Result<Request<'_>, Error>) -> bool {
     conn.respond(reply)
 }
 
-/// `bytes` as a vector of `index`, as many `f32`s as it has dimensions: `bin` is little-endian
-/// `f32`s, `str` finite decimals split by spaces. A missing index is not found, and any other
-/// vector a bad value.
-pub fn read_vector(index: &str, bytes: &[u8], format: Format) -> Result<Vec<f32>, Error> {
-    let dim = index::dimensions(index).ok_or(Error::NotFound)?;
+/// `bytes` as a vector of `index`, as many `f32`s as it has dimensions, in its scalar kind: `bin`
+/// is little-endian `f32`s, `str` finite decimals split by spaces. A missing index is not found,
+/// and any other vector a bad value.
+pub fn read_vector(index: &str, bytes: &[u8], format: Format) -> Result<Vector, Error> {
+    let (dim, kind) = index::layout(index).ok_or(Error::NotFound)?;
     let vector: Vec<f32> = match format {
         Format::Bin => {
             let (words, rest) = bytes.as_chunks();
@@ -48,7 +49,7 @@ pub fn read_vector(index: &str, bytes: &[u8], format: Format) -> Result<Vec<f32>
             .ok_or(Error::BadValue)?,
     };
     if vector.len() == dim {
-        Ok(vector)
+        quant::quantize(vector, kind)
     } else {
         Err(Error::BadValue)
     }
@@ -82,7 +83,7 @@ mod tests {
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();
-        let four = Ok(vec![1.0, -2.5, 0.0, 3.25]);
+        let four = Ok(Vector::F32(vec![1.0, -2.5, 0.0, 3.25]));
         assert_eq!(read_vector("four", &bin, Format::Bin), four);
         let bad = Err(Error::BadValue);
         assert_eq!(read_vector("four", &bin[..12], Format::Bin), bad);

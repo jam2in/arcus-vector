@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{LazyLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use usearch::{Index, IndexOptions};
+use usearch::{Index, IndexOptions, ScalarKind};
 
 use crate::error::Error;
 use crate::protocol::Create;
@@ -25,6 +25,13 @@ pub fn create(spec: &Create<'_>) -> Result<(), Error> {
 
 pub fn dimensions(name: &str) -> Option<usize> {
     read().get(name).map(Index::dimensions)
+}
+
+/// The dimensions and scalar kind of the index at `name`.
+pub fn layout(name: &str) -> Option<(usize, ScalarKind)> {
+    read()
+        .get(name)
+        .map(|index| (index.dimensions(), index.scalar_kind()))
 }
 
 fn read() -> RwLockReadGuard<'static, HashMap<String, Index>> {
