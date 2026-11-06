@@ -5,9 +5,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Barrier, OnceLock};
+use std::sync::{Arc, OnceLock};
 
-use super::ops;
+use super::{ops, sweeper};
 use crate::error::Error;
 use crate::memcached::server::IoWait;
 use crate::protocol::{Request, Search, Source};
@@ -93,20 +93,25 @@ struct Lane {
 // Set at load, and again in the child of `-d`'s fork, where the lanes made at load are gone.
 static POOL: AtomicPtr<[Lane; NUM_LANES]> = AtomicPtr::new(ptr::null_mut());
 
-/// Starts the lanes, and has them started again when `-d` forks to daemonize.
+/// Starts the lanes, and has them started again when `-d` forks to daemonize; on failure, the
+/// threads that did start are shut down.
 pub fn start() -> bool {
     // SAFETY: `restart` is a plain fn that catches its own panics.
-    spawn() && unsafe { pthread_atfork(None, None, Some(restart)) == 0 }
+    let started = spawn() && unsafe { pthread_atfork(None, None, Some(restart)) == 0 };
+    if !started {
+        shutdown();
+    }
+    started
 }
 
 /// Has each lane end once the job it runs is done; the queued ones drop unrun, waking their
 /// connections to an internal error. Does not wait for the lanes to end.
-#[expect(dead_code, reason = "nothing closes the lanes yet")]
 pub fn shutdown() {
     // SAFETY: a non-null `POOL` is a leaked array, never freed.
     if let Some(lanes) = unsafe { POOL.load(Ordering::Acquire).as_ref() } {
         lanes.iter().for_each(close);
     }
+    sweeper::shutdown();
 }
 
 fn close(lane: &Lane) {
@@ -118,7 +123,8 @@ fn close(lane: &Lane) {
     });
 }
 
-/// `false` if a thread could not be made.
+/// Starts the lanes and the sweeper; `false` if a thread could not be made, leaving those that
+/// were for [`shutdown`].
 fn spawn() -> bool {
     let mut receivers = Vec::with_capacity(NUM_LANES);
     let lanes: &'static [Lane; NUM_LANES] = Box::leak(Box::new(std::array::from_fn(|_| {
@@ -130,24 +136,29 @@ fn spawn() -> bool {
             closed: AtomicBool::new(false),
         }
     })));
-    // A fork must not catch a lane mid-start, holding a global lock (allocator, TLS) the child
+    // A fork must not catch a thread mid-start, holding a global lock (allocator, TLS) the child
     // needs; lane channels need no care, as the child builds a new pool.
-    let ready = Arc::new(Barrier::new(NUM_LANES + 1));
+    let (ready, started) = channel();
+    let mut spawned = 0;
     for (n, (lane, rx)) in lanes.iter().zip(receivers).enumerate() {
-        let ready = Arc::clone(&ready);
-        let spawned = std::thread::Builder::new()
+        let ready = ready.clone();
+        let thread = std::thread::Builder::new()
             .name(format!("arcus-vector-{n}"))
             .spawn(move || {
-                ready.wait();
+                let _ = ready.send(());
                 run(lane, &rx);
             });
-        if spawned.is_err() {
-            return false;
+        if thread.is_err() {
+            break;
         }
+        spawned += 1;
     }
-    ready.wait();
+    let all = spawned == NUM_LANES && sweeper::spawn(&ready);
+    for _ in 0..spawned + usize::from(all) {
+        let _ = started.recv();
+    }
     POOL.store(ptr::from_ref(lanes).cast_mut(), Ordering::Release);
-    true
+    all
 }
 
 unsafe extern "C" {

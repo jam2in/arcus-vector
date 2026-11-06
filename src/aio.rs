@@ -1,5 +1,6 @@
 mod ops;
 mod pool;
+mod sweeper;
 
 use std::borrow::Cow;
 use std::os::raw::c_void;
@@ -9,6 +10,7 @@ use crate::error::Error;
 use crate::guard;
 use crate::memcached::server::{Connection, ResponseHandler};
 pub use pool::{NUM_LANES, Op, start};
+pub use sweeper::release;
 
 /// Hands `op` to a lane; `conn`, if any, is replied to from the io callback once it is done.
 pub fn begin(op: Op, conn: Option<Connection>) -> bool {

@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use super::pool::Op;
+use super::sweeper;
 use crate::bson;
 use crate::error::Error;
 use crate::index::{self, Graph};
@@ -71,30 +72,24 @@ fn replace(graph: Result<Arc<Graph>, Error>, old: usize, new: usize) -> Result<(
         let (old_elem, new_elem) = (Elem::new(old)?, Elem::new(new)?);
         let (from, to) = (old as u64, new as u64);
         let same = graph.contains(from) && old_elem.same_vector(&new_elem) == Some(true);
-        let moved = if same && graph.rename(from, to)? {
-            Ok(())
-        } else {
-            graph.remove(from)?;
-            vector(&new_elem, &graph).and_then(|v| graph.add(to, &v))
-        };
-        graph.wait_for_searches();
-        moved
+        if same && graph.rename(from, to)? {
+            return Ok(());
+        }
+        graph.remove(from)?;
+        vector(&new_elem, &graph).and_then(|v| graph.add(to, &v))
     });
-    let released = Elem::new(old).map(Elem::release);
-    moved.and(released)
+    sweeper::release(old);
+    moved
 }
 
 fn delete(graph: Result<Arc<Graph>, Error>, key: usize) -> Result<(), Error> {
-    let removed = graph.and_then(|graph| {
-        let removed = graph.remove(key as u64);
-        graph.wait_for_searches();
-        removed
-    });
-    let released = Elem::new(key).map(Elem::release);
-    removed.map(|_| ()).and(released)
+    let removed = graph.and_then(|graph| graph.remove(key as u64));
+    sweeper::release(key);
+    removed.map(|_| ())
 }
 
 fn search(index: &str, vector: &Vector, k: usize, with_meta: bool) -> Result<Vec<u8>, Error> {
+    let _reading = sweeper::block().ok_or(Error::Internal)?;
     graph(index)?.search_with(vector, k, |found| {
         let mut out = Vec::new();
         put(&mut out, format!("VECTORS {}\r\n", found.len()).as_bytes())?;

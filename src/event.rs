@@ -112,8 +112,8 @@ unsafe extern "C" fn on_item_event(
             if let Op::Delete { index, map, .. } = &op
                 && index::of_map(index, *map).is_none()
             {
-                // No graph has the element; the engine frees it now.
-                ev.target_ref = 1;
+                // No graph has the element, but a search of a just dropped one may still read it.
+                aio::release(ev.target.expose_provenance());
                 return;
             }
             // `CONN` is none when the change came from replication or replay.
