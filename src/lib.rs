@@ -7,6 +7,7 @@ mod cmd;
 mod element;
 mod error;
 mod event;
+mod filter;
 mod index;
 mod memcached;
 mod nread;

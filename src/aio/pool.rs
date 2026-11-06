@@ -9,6 +9,7 @@ use std::sync::{Arc, OnceLock};
 
 use super::{ops, sweeper};
 use crate::error::Error;
+use crate::filter::Filter;
 use crate::memcached::server::IoWait;
 use crate::protocol::{Request, Search, Source};
 use crate::quant::Vector;
@@ -26,7 +27,7 @@ struct Task {
 
 #[rustfmt::skip]
 pub enum Op {
-    Search { index: String, vector: Vector, k: usize, with_meta: bool },
+    Search { index: String, vector: Vector, k: usize, filter: Option<Filter>, with_meta: bool },
     Insert { index: String, map: usize, key: usize },
     Replace { index: String, map: usize, old: usize, new: usize },
     /// A replace from `vop setmeta`, answered as a store.
@@ -47,12 +48,14 @@ impl Op {
                 source: Source::Vector { .. },
                 vector,
                 k,
-                filter_bytes: None,
+                filter,
                 with_meta,
+                ..
             }) => Ok(Self::Search {
                 index: index.into(),
                 vector,
                 k,
+                filter,
                 with_meta,
             }),
             _ => Err(Error::NotSupported),
@@ -274,6 +277,7 @@ mod tests {
                 index: "idx".into(),
                 vector: Vector::default(),
                 k: 1,
+                filter: None,
                 with_meta: false,
             };
             let reply = Arc::default();
@@ -314,6 +318,7 @@ mod tests {
                         index: "idx".into(),
                         vector: Vector::default(),
                         k: 1,
+                        filter: None,
                         with_meta: false,
                     },
                     reply: Arc::clone(&reply),
