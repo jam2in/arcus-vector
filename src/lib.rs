@@ -5,6 +5,7 @@ mod ascii;
 mod bson;
 mod cmd;
 mod error;
+mod event;
 mod index;
 mod memcached;
 mod nread;
@@ -50,6 +51,7 @@ fn initialize(get_server_api: GET_SERVER_API) -> Result<(), &'static str> {
     if !aio::start() {
         return Err("the lane threads could not start");
     }
+    event::install();
     // SAFETY: `DESCRIPTOR` is static and only the core touches it from here on (it writes `next`).
     if !unsafe { memcached::server::register_ascii(&raw mut ascii::DESCRIPTOR) } {
         return Err("the server refused the ASCII protocol extension");

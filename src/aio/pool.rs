@@ -8,30 +8,36 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Barrier, OnceLock};
 
 use crate::error::Error;
-use crate::memcached::server::IoWaiter;
+use crate::memcached::server::IoWait;
 use crate::protocol::{Request, Search, Source};
 use crate::quant::Vector;
 
 const NUM_LANES: usize = 32;
 
-/// A command for a lane, where it leaves the reply for the io callback, and the connection to wake
-/// once it is done.
+/// An op for a lane, where it leaves the reply for the io callback, and the connection to wake once
+/// it is done: none for a change from replication or replay.
 struct Task {
     op: Op,
     /// Unset if its lane did not finish it.
     reply: Arc<OnceLock<Cow<'static, [u8]>>>,
-    _wait: IoWaiter,
+    _wait: Option<IoWait>,
 }
 
 #[expect(dead_code, reason = "no op runs yet")]
+#[rustfmt::skip]
 pub enum Op {
     Search { index: String, vector: Vector },
-    Upsert { index: String, vkey: String },
-    SetMeta { index: String, vkey: String },
-    Delete { index: String, vkey: String },
+    Insert { index: String, key: usize },
+    Replace { index: String, old: usize, new: usize },
+    /// A replace from `vop setmeta`, answered as a store.
+    SetMeta { index: String, old: usize, new: usize },
+    Delete { index: String, key: usize },
+    Create { index: String, config: Vec<u8> },
+    Drop { index: String },
 }
 
 impl Op {
+    /// A command's search; a write's op comes from the element event it raises.
     pub fn new(request: Request<'_>) -> Result<Self, Error> {
         match request {
             // Waits for the engine to give the vkey's vector.
@@ -43,30 +49,21 @@ impl Op {
                 index: index.into(),
                 vector,
             }),
-            Request::Upsert(u) => Ok(Self::Upsert {
-                index: u.index.into(),
-                vkey: u.vkey.into(),
-            }),
-            Request::SetMeta(m) => Ok(Self::SetMeta {
-                index: m.index.into(),
-                vkey: m.vkey.into(),
-            }),
-            Request::Delete { index, vkey } => Ok(Self::Delete {
-                index: index.into(),
-                vkey: vkey.into(),
-            }),
             _ => Err(Error::NotSupported),
         }
     }
 
-    /// A search goes to the least busy lane; a write goes to its vkey's lane, so that writes on one
-    /// vkey run in the order they came.
+    /// A search goes to the least busy lane; a write goes to its index's lane, so that writes on
+    /// one index run in the order the engine made them.
     fn lane(&self) -> &'static Lane {
         match self {
             Self::Search { .. } => idlest(),
-            Self::Upsert { index, vkey }
-            | Self::SetMeta { index, vkey }
-            | Self::Delete { index, vkey } => lane_of(index, vkey),
+            Self::Insert { index, .. }
+            | Self::Replace { index, .. }
+            | Self::SetMeta { index, .. }
+            | Self::Delete { index, .. }
+            | Self::Create { index, .. }
+            | Self::Drop { index } => lane_of(index),
         }
     }
 }
@@ -74,9 +71,13 @@ impl Op {
 impl Task {
     fn run(self) {
         let reply = match self.op {
-            Op::Search { .. } | Op::Upsert { .. } | Op::SetMeta { .. } | Op::Delete { .. } => {
-                Error::NotSupported.reply()
-            }
+            Op::Search { .. }
+            | Op::Insert { .. }
+            | Op::Replace { .. }
+            | Op::SetMeta { .. }
+            | Op::Delete { .. }
+            | Op::Create { .. }
+            | Op::Drop { .. } => Error::NotSupported.reply(),
         };
         let _ = self.reply.set(Cow::Borrowed(reply));
     }
@@ -177,20 +178,20 @@ fn idlest() -> &'static Lane {
     idlest
 }
 
-fn lane_of(index: &str, vkey: &str) -> &'static Lane {
+fn lane_of(index: &str) -> &'static Lane {
     let mut hasher = DefaultHasher::new();
-    (index, vkey).hash(&mut hasher);
+    index.hash(&mut hasher);
     &lanes()[(hasher.finish() % NUM_LANES as u64) as usize]
 }
 
 /// Runs `op` on its lane, which leaves its reply in `reply`, then wakes the connection.
-pub fn submit(op: Op, reply: Arc<OnceLock<Cow<'static, [u8]>>>, waiter: IoWaiter) {
+pub fn submit(op: Op, reply: Arc<OnceLock<Cow<'static, [u8]>>>, wait: Option<IoWait>) {
     send(
         op.lane(),
         Task {
             op,
             reply,
-            _wait: waiter,
+            _wait: wait,
         },
     );
 }
@@ -230,13 +231,13 @@ mod tests {
             };
             let reply = Arc::default();
             // SAFETY: the fake server takes a wait on a `Conn` at any time.
-            let waiter = unsafe { conn.connection().wait_for_io() };
+            let wait = Some(unsafe { conn.connection().wait_for_io() });
             send(
                 &lanes()[3],
                 Task {
                     op,
                     reply,
-                    _wait: waiter,
+                    _wait: wait,
                 },
             );
         }
@@ -247,11 +248,11 @@ mod tests {
     }
 
     #[test]
-    fn one_vkey_always_gets_one_lane() {
+    fn one_index_always_gets_one_lane() {
         start_once();
-        assert!(ptr::eq(lane_of("idx", "a"), lane_of("idx", "a")));
+        assert!(ptr::eq(lane_of("idx"), lane_of("idx")));
         let spread = (0..1000)
-            .map(|n| ptr::from_ref(lane_of("idx", &format!("v{n}"))))
+            .map(|n| ptr::from_ref(lane_of(&format!("idx{n}"))))
             .collect::<HashSet<_>>();
         assert_eq!(spread.len(), NUM_LANES);
     }
