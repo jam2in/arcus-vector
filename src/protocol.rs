@@ -36,7 +36,7 @@ pub const KEY_MAX_LENGTH: usize = 16000;
 /// element value, CRLF included, before it reaches the engine.
 pub const MAX_ELEMENT_BYTES: usize = 16 * 1024;
 
-fn parse_metric(word: &str) -> Option<MetricKind> {
+pub fn parse_metric(word: &str) -> Option<MetricKind> {
     match word {
         "cos" => Some(MetricKind::Cos),
         "l2" => Some(MetricKind::L2sq),
@@ -47,13 +47,32 @@ fn parse_metric(word: &str) -> Option<MetricKind> {
     }
 }
 
-fn parse_quant(word: &str) -> Option<ScalarKind> {
+pub const fn metric_word(metric: MetricKind) -> &'static str {
+    match metric {
+        MetricKind::L2sq => "l2",
+        MetricKind::IP => "ip",
+        MetricKind::Hamming => "hamming",
+        MetricKind::Tanimoto => "tanimoto",
+        _ => "cos",
+    }
+}
+
+pub fn parse_quant(word: &str) -> Option<ScalarKind> {
     match word {
         "f32" => Some(ScalarKind::F32),
         "f16" => Some(ScalarKind::F16),
         "i8" => Some(ScalarKind::I8),
         "b1" => Some(ScalarKind::B1),
         _ => None,
+    }
+}
+
+pub const fn quant_word(quant: ScalarKind) -> &'static str {
+    match quant {
+        ScalarKind::F16 => "f16",
+        ScalarKind::I8 => "i8",
+        ScalarKind::B1 => "b1",
+        _ => "f32",
     }
 }
 

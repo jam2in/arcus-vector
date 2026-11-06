@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Barrier, OnceLock};
 
+use super::ops;
 use crate::error::Error;
 use crate::memcached::server::IoWait;
 use crate::protocol::{Request, Search, Source};
@@ -23,37 +24,40 @@ struct Task {
     _wait: Option<IoWait>,
 }
 
-#[expect(dead_code, reason = "no op runs yet")]
 #[rustfmt::skip]
 pub enum Op {
-    Search { index: String, vector: Vector },
-    Insert { index: String, key: usize },
-    Replace { index: String, old: usize, new: usize },
+    Search { index: String, vector: Vector, k: usize, with_meta: bool },
+    Insert { index: String, map: usize, key: usize },
+    Replace { index: String, map: usize, old: usize, new: usize },
     /// A replace from `vop setmeta`, answered as a store.
-    SetMeta { index: String, old: usize, new: usize },
-    Delete { index: String, key: usize },
-    Create { index: String, config: Vec<u8> },
-    Drop { index: String },
+    SetMeta { index: String, map: usize, old: usize, new: usize },
+    Delete { index: String, map: usize, key: usize },
+    Create { index: String, map: usize, config: Vec<u8> },
+    Drop { index: String, map: usize },
 }
 
 impl Op {
     /// A command's search; a write's op comes from the element event it raises.
     pub fn new(request: Request<'_>) -> Result<Self, Error> {
         match request {
-            // Waits for the engine to give the vkey's vector.
             Request::Search(Search {
-                source: Source::Vkey(_),
-                ..
-            }) => Err(Error::NotSupported),
-            Request::Search(Search { index, vector, .. }) => Ok(Self::Search {
+                index,
+                source: Source::Vector { .. },
+                vector,
+                k,
+                filter_bytes: None,
+                with_meta,
+            }) => Ok(Self::Search {
                 index: index.into(),
                 vector,
+                k,
+                with_meta,
             }),
             _ => Err(Error::NotSupported),
         }
     }
 
-    /// A search goes to the least busy lane; a write goes to its index's lane, so that writes on
+    /// A search goes to the least busy lane; a change goes to its index's lane, so that changes to
     /// one index run in the order the engine made them.
     fn lane(&self) -> &'static Lane {
         match self {
@@ -63,23 +67,15 @@ impl Op {
             | Self::SetMeta { index, .. }
             | Self::Delete { index, .. }
             | Self::Create { index, .. }
-            | Self::Drop { index } => lane_of(index),
+            | Self::Drop { index, .. } => lane_of(index),
         }
     }
 }
 
 impl Task {
     fn run(self) {
-        let reply = match self.op {
-            Op::Search { .. }
-            | Op::Insert { .. }
-            | Op::Replace { .. }
-            | Op::SetMeta { .. }
-            | Op::Delete { .. }
-            | Op::Create { .. }
-            | Op::Drop { .. } => Error::NotSupported.reply(),
-        };
-        let _ = self.reply.set(Cow::Borrowed(reply));
+        let reply = ops::run(&self.op).unwrap_or_else(|e| Cow::Borrowed(e.reply()));
+        let _ = self.reply.set(reply);
     }
 }
 
@@ -185,7 +181,7 @@ fn lane_of(index: &str) -> &'static Lane {
 }
 
 /// Runs `op` on its lane, which leaves its reply in `reply`, then wakes the connection.
-pub fn submit(op: Op, reply: Arc<OnceLock<Cow<'static, [u8]>>>, wait: Option<IoWait>) {
+pub fn submit(op: Op, reply: Arc<OnceLock<Cow<'static, [u8]>>>, wait: Option<IoWait>) -> bool {
     send(
         op.lane(),
         Task {
@@ -193,13 +189,20 @@ pub fn submit(op: Op, reply: Arc<OnceLock<Cow<'static, [u8]>>>, wait: Option<IoW
             reply,
             _wait: wait,
         },
-    );
+    )
 }
 
-fn send(lane: &Lane, task: Task) {
+/// `false` only if the lane's thread is gone, which never returns; the task then drops, waking its
+/// connection to an internal error.
+fn send(lane: &Lane, task: Task) -> bool {
     lane.load.fetch_add(1, Ordering::Relaxed);
-    // Fails only if the lane's thread is gone, and a lane never returns.
-    let _ = lane.tasks.send(task);
+    match lane.tasks.send(task) {
+        Ok(()) => true,
+        Err(_) => {
+            lane.load.fetch_sub(1, Ordering::Relaxed);
+            false
+        }
+    }
 }
 
 fn run(lane: &Lane, tasks: &Receiver<Task>) {
@@ -228,6 +231,8 @@ mod tests {
             let op = Op::Search {
                 index: "idx".into(),
                 vector: Vector::default(),
+                k: 1,
+                with_meta: false,
             };
             let reply = Arc::default();
             // SAFETY: the fake server takes a wait on a `Conn` at any time.
