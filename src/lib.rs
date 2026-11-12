@@ -1,18 +1,12 @@
 //! arcus-vector: vector search as an extension to arcus-memcached.
 
-mod aio;
 mod ascii;
-mod bson;
-mod cmd;
-mod element;
+mod data;
 mod error;
-mod event;
-mod filter;
+mod exec;
 mod index;
+mod lane;
 mod memcached;
-mod nread;
-mod protocol;
-mod quant;
 
 use std::os::raw::c_char;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -50,12 +44,12 @@ pub extern "C" fn memcached_extensions_initialize(
 fn initialize(get_server_api: GET_SERVER_API) -> Result<(), &'static str> {
     let get_server_api = get_server_api.ok_or("the server passed no get_server_api")?;
     memcached::server::set(get_server_api)?;
-    event::install();
+    exec::event::install();
     // SAFETY: `DESCRIPTOR` is static and only the core touches it from here on (it writes `next`).
     if !unsafe { memcached::server::register_ascii(&raw mut ascii::DESCRIPTOR) } {
         return Err("the server refused the ASCII protocol extension");
     }
-    if !aio::start() {
+    if !lane::start() {
         return Err("the lane threads could not start");
     }
     Ok(())

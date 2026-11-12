@@ -47,36 +47,6 @@ impl<'a> Tokens<'a> {
     }
 }
 
-/// The returned buffer owns the bytes the tokens point into, so it must outlive them.
-#[cfg(test)]
-pub fn tokenize(line: &str) -> (Vec<u8>, Vec<token_t>) {
-    let mut buf = line.as_bytes().to_vec();
-    let mut spans = Vec::new();
-    let mut start = 0;
-    for (i, byte) in buf.iter_mut().enumerate() {
-        if *byte == b' ' {
-            if start != i {
-                spans.push((start, i - start));
-            }
-            *byte = 0;
-            start = i + 1;
-        }
-    }
-    if start != buf.len() {
-        spans.push((start, buf.len() - start));
-    }
-    let base = buf.as_mut_ptr();
-    let tokens = spans
-        .into_iter()
-        .map(|(off, len)| token_t {
-            // SAFETY: every span starts inside `buf`, so `base.add(off)` stays in bounds.
-            value: unsafe { base.add(off) }.cast(),
-            length: len,
-        })
-        .collect();
-    (buf, tokens)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

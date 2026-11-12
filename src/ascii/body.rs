@@ -1,13 +1,16 @@
 use std::os::raw::c_char;
 
-use crate::bson;
-use crate::cmd;
+use crate::ascii::{self, Request, Tokens};
+use crate::data::filter::Filter;
+use crate::data::meta;
+use crate::data::vector;
 use crate::error::Error;
-use crate::filter::Filter;
+use crate::exec::command;
 use crate::index;
+use crate::memcached::MAX_ELEMENT_BYTES;
 use crate::memcached::server::Connection;
-use crate::protocol::{self, MAX_BODY_BYTES, MAX_ELEMENT_BYTES, Request, Tokens};
-use crate::quant;
+
+pub const MAX_BODY_BYTES: usize = 1 << 20;
 
 pub enum Body {
     None,
@@ -42,7 +45,7 @@ impl Pending {
     /// Parses the kept line again, checks each body segment ends in CRLF, and fills in the vector
     /// it carries, read as its index's.
     pub fn request(&self) -> Result<Request<'_>, Error> {
-        let mut request = protocol::parse(Tokens::from_line(&self.line).words())?;
+        let mut request = ascii::parse(Tokens::from_line(&self.line).words())?;
         let [vector, extra] = request.segments();
         let mut rest = self.body.as_slice();
         let mut cut = |n: Option<usize>| -> Result<&[u8], Error> {
@@ -57,8 +60,8 @@ impl Pending {
             Request::Search(s) if s.filter_bytes.is_some() => {
                 s.filter = Some(Filter::parse(extra)?);
             }
-            Request::Upsert(u) if u.meta_bytes.is_some() => u.meta = bson::from_json(extra)?,
-            Request::SetMeta(s) => s.meta = bson::from_json(extra)?,
+            Request::Upsert(u) if u.meta_bytes.is_some() => u.meta = meta::from_json(extra)?,
+            Request::SetMeta(s) => s.meta = meta::from_json(extra)?,
             _ => {}
         }
         // Without the index there is nothing to read the vector as; the command says why.
@@ -66,7 +69,7 @@ impl Pending {
             return Ok(request);
         }
         if let Some(format) = request.vector_format() {
-            request.set_vector(cmd::read_vector(request.index(), bytes, format)?);
+            request.set_vector(command::read_vector(request.index(), bytes, format)?);
         }
         if let Some(meta) = request.meta() {
             check_element(request.index(), meta)?;
@@ -78,7 +81,7 @@ impl Pending {
 /// Refuses an element of `index` with `meta` that the core would refuse as too long.
 fn check_element(index: &str, meta: &[u8]) -> Result<(), Error> {
     let (dim, kind) = index::layout(index).ok_or(Error::NotFound)?;
-    if meta.len() + quant::byte_len(dim, kind) + 2 > MAX_ELEMENT_BYTES {
+    if meta.len() + vector::byte_len(dim, kind) + 2 > MAX_ELEMENT_BYTES {
         return Err(Error::TooLargeValue);
     }
     Ok(())
@@ -108,7 +111,7 @@ mod tests {
     use super::*;
 
     fn body_of(line: &str) -> Body {
-        body(&protocol::parse(Tokens::from_line(line).words()).unwrap())
+        body(&ascii::parse(Tokens::from_line(line).words()).unwrap())
     }
 
     #[test]
@@ -117,7 +120,7 @@ mod tests {
             ("toolarge", 4, "cos", "f32", 4 * 4),
             ("toolarge_b1", 16, "hamming", "b1", 2),
         ] {
-            let config = index::test_config(dim, metric, quant);
+            let config = index::tests::test_config(dim, metric, quant);
             assert_eq!(index::create(name, 0, &config), Ok(()));
             let fits = vec![0; MAX_ELEMENT_BYTES - 2 - vector];
             assert_eq!(check_element(name, &fits), Ok(()));

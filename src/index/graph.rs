@@ -4,9 +4,9 @@ use std::sync::{PoisonError, RwLock, RwLockReadGuard};
 use numkong::f16;
 use usearch::{Index, IndexOptions, ScalarKind, VectorType, b1x8};
 
-use crate::aio::NUM_LANES;
+use crate::data::vector::Vector;
 use crate::error::Error;
-use crate::quant::Vector;
+use crate::lane::NUM_LANES;
 
 const MIN_CAPACITY: usize = 1024;
 /// The key usearch writes into a removed slot: `default_free_value`, the largest key.
@@ -179,7 +179,7 @@ mod tests {
     use usearch::MetricKind;
 
     use super::*;
-    use crate::quant;
+    use crate::data::vector;
 
     fn search(g: &Graph, query: &Vector, count: usize) -> Result<Vec<(u64, f32)>, Error> {
         g.search_with(query, count, None::<fn(u64) -> bool>, |found| {
@@ -203,7 +203,7 @@ mod tests {
     }
 
     fn vector(values: &[f32], kind: ScalarKind) -> Vector {
-        quant::quantize(values.to_vec(), kind).unwrap()
+        vector::quantize(values.to_vec(), kind).unwrap()
     }
 
     #[test]

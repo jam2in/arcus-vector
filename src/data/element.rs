@@ -4,9 +4,9 @@
 use bson::RawDocument;
 use usearch::ScalarKind;
 
+use crate::data::vector::Vector;
 use crate::error::Error;
 use crate::memcached::engine::Elem;
-use crate::quant::Vector;
 
 impl Elem {
     pub fn vkey(&self) -> Option<&[u8]> {
