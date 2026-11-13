@@ -6,11 +6,8 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use super::{Waiter, ops, sweeper};
-use crate::error::Error;
-use crate::filter::Filter;
-use crate::protocol::{Request, Search};
-use crate::quant::Vector;
+use super::op::{self, Op};
+use super::{Waiter, sweeper};
 
 pub const NUM_LANES: usize = 32;
 
@@ -20,42 +17,7 @@ struct Task {
     waiter: Option<Waiter>,
 }
 
-#[rustfmt::skip]
-pub enum Op {
-    Search { index: String, vector: Vector, k: usize, filter: Option<Filter>, with_meta: bool },
-    Insert { index: String, map: usize, key: usize },
-    Replace { index: String, map: usize, old: usize, new: usize },
-    /// A replace from `vop setmeta`, answered as a store.
-    SetMeta { index: String, map: usize, old: usize, new: usize },
-    Delete { index: String, map: usize, key: usize },
-    Create { index: String, map: usize, config: Vec<u8> },
-    Drop { index: String, map: usize },
-    /// Wakes an idle lane to see it is closed.
-    Shutdown,
-}
-
 impl Op {
-    /// A command's search; a write's op comes from the element event it raises.
-    pub fn new(request: Request<'_>) -> Result<Self, Error> {
-        match request {
-            Request::Search(Search {
-                index,
-                vector,
-                k,
-                filter,
-                with_meta,
-                ..
-            }) => Ok(Self::Search {
-                index: index.into(),
-                vector,
-                k,
-                filter,
-                with_meta,
-            }),
-            _ => Err(Error::NotSupported),
-        }
-    }
-
     /// A search goes to the least busy lane; a change goes to its index's lane, so that changes to
     /// one index run in the order the engine made them. A shutdown goes to every lane, from
     /// [`close`].
@@ -75,7 +37,7 @@ impl Op {
 
 impl Task {
     fn run(self) {
-        let reply = ops::run(&self.op).unwrap_or_else(|e| Cow::Borrowed(e.reply()));
+        let reply = op::run(&self.op).unwrap_or_else(|e| Cow::Borrowed(e.reply()));
         if let Some(waiter) = self.waiter {
             waiter.answer(reply);
         }
@@ -181,12 +143,6 @@ fn lanes() -> &'static [Lane; NUM_LANES] {
     unsafe { POOL.load(Ordering::Acquire).as_ref() }.expect("the lanes start at load")
 }
 
-#[cfg(test)]
-pub fn start_once() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| assert!(spawn()));
-}
-
 fn idlest() -> &'static Lane {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
 
@@ -247,12 +203,19 @@ fn run(lane: &Lane, tasks: &Receiver<Task>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashSet;
     use std::time::Duration;
 
     use super::*;
+    use crate::data::vector::Vector;
+    use crate::error::Error;
     use crate::memcached::server::fake;
+
+    pub fn start_once() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| assert!(spawn()));
+    }
 
     #[test]
     fn ops_on_one_lane_run_in_submit_order() {

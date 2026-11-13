@@ -3,16 +3,16 @@ use std::sync::Arc;
 
 use usearch::ScalarKind;
 
-use crate::aio::{self, Op, Waiter};
-use crate::bson;
-use crate::element;
+use crate::ascii::{Format, Request, Source};
+use crate::data::element;
+use crate::data::meta;
+use crate::data::vector::{self, Vector};
 use crate::error::Error;
-use crate::event::{self, Expect};
+use crate::exec::event::{self, Expect};
 use crate::index::{self, Graph};
+use crate::lane::{self, Op, Waiter};
 use crate::memcached::engine::{self, Store};
 use crate::memcached::server::{self, Connection};
-use crate::protocol::{Format, Request, Source};
-use crate::quant::{self, Vector};
 
 /// A reply now, or `None` once a lane has the connection to reply to.
 type Reply = Option<Cow<'static, [u8]>>;
@@ -64,7 +64,7 @@ fn execute(conn: Connection, request: Request<'_>) -> Result<Reply, Error> {
             let _entered = graph.enter().ok_or(Error::NotFound)?;
             let (dim, kind) = graph.layout();
             // The replace fills the vector from the element it replaces, as the engine holds it.
-            let value = element::with_blank_vector(&s.meta, quant::byte_len(dim, kind))?;
+            let value = element::with_blank_vector(&s.meta, vector::byte_len(dim, kind))?;
             event::offer(conn, Expect::SetMeta, || {
                 store.update_elem(s.index, s.vkey, &value)
             });
@@ -74,7 +74,7 @@ fn execute(conn: Connection, request: Request<'_>) -> Result<Reply, Error> {
             let (_, store) = open(conn, index)?;
             let value = store.get_elem(index, vkey)?;
             let (doc, _) = element::split(&value).ok_or(Error::Internal)?;
-            let json = bson::to_json(doc)?;
+            let json = meta::to_json(doc)?;
             let reply = format!("META {vkey} {}\r\n{json}\r\n", json.len());
             Ok(Some(Cow::Owned(reply.into_bytes())))
         }
@@ -100,7 +100,7 @@ fn execute(conn: Connection, request: Request<'_>) -> Result<Reply, Error> {
                 return Err(Error::NotFound);
             }
             drop(entered);
-            aio::begin(Op::new(Request::Search(search))?, Some(Waiter::new(conn)));
+            lane::begin(Op::new(Request::Search(search))?, Some(Waiter::new(conn)));
             Ok(None)
         }
     }
@@ -129,7 +129,7 @@ fn fits(vector: &Vector, (dim, kind): (usize, ScalarKind)) -> bool {
         Vector::I8(v) => (ScalarKind::I8, v.len()),
         Vector::B1(v) => (ScalarKind::B1, v.len()),
     };
-    of == kind && len == quant::byte_len(dim, kind)
+    of == kind && len == vector::byte_len(dim, kind)
 }
 
 /// `bytes` as a vector of `index`, as many finite `f32`s as it has dimensions, in its scalar kind:
@@ -158,7 +158,7 @@ pub fn read_vector(index: &str, bytes: &[u8], format: Format) -> Result<Vector, 
     }
     .ok_or(Error::BadValue)?;
     if vector.len() == dim {
-        quant::quantize(vector, kind)
+        vector::quantize(vector, kind)
     } else {
         Err(Error::BadValue)
     }
@@ -178,7 +178,7 @@ mod tests {
 
     #[test]
     fn a_vector_is_read_as_its_index_dimensions() {
-        let created = index::create("four", 0, &index::test_config(4, "cos", "f32"));
+        let created = index::create("four", 0, &index::tests::test_config(4, "cos", "f32"));
         assert_eq!(created, Ok(()));
         let bin: Vec<u8> = [1.0f32, -2.5, 0.0, 3.25]
             .iter()

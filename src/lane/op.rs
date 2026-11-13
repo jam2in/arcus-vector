@@ -1,14 +1,51 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use super::pool::Op;
 use super::sweeper;
-use crate::bson;
+use crate::ascii::{Request, Search};
+use crate::data::filter::Filter;
+use crate::data::meta;
+use crate::data::vector::Vector;
 use crate::error::Error;
-use crate::filter::Filter;
 use crate::index::{self, Graph};
 use crate::memcached::engine::Elem;
-use crate::quant::Vector;
+
+#[rustfmt::skip]
+pub enum Op {
+    Search { index: String, vector: Vector, k: usize, filter: Option<Filter>, with_meta: bool },
+    Insert { index: String, map: usize, key: usize },
+    Replace { index: String, map: usize, old: usize, new: usize },
+    /// A replace from `vop setmeta`, answered as a store.
+    SetMeta { index: String, map: usize, old: usize, new: usize },
+    Delete { index: String, map: usize, key: usize },
+    Create { index: String, map: usize, config: Vec<u8> },
+    Drop { index: String, map: usize },
+    /// Wakes an idle lane to see it is closed.
+    Shutdown,
+}
+
+impl Op {
+    /// A command's search; a write's op comes from the element event it raises.
+    pub fn new(request: Request<'_>) -> Result<Self, Error> {
+        match request {
+            Request::Search(Search {
+                index,
+                vector,
+                k,
+                filter,
+                with_meta,
+                ..
+            }) => Ok(Self::Search {
+                index: index.into(),
+                vector,
+                k,
+                filter,
+                with_meta,
+            }),
+            _ => Err(Error::NotSupported),
+        }
+    }
+}
 
 pub fn run(op: &Op) -> Result<Cow<'static, [u8]>, Error> {
     match op {
@@ -107,7 +144,7 @@ fn search(
             put(&mut out, elem.vkey().ok_or(Error::Internal)?)?;
             put(&mut out, format!(" {}", score_text(score)).as_bytes())?;
             if with_meta {
-                let json = bson::to_json(elem.meta().ok_or(Error::Internal)?.as_bytes())?;
+                let json = meta::to_json(elem.meta().ok_or(Error::Internal)?.as_bytes())?;
                 put(&mut out, format!(" {}\r\n", json.len()).as_bytes())?;
                 put(&mut out, json.as_bytes())?;
             }

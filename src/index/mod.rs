@@ -1,12 +1,14 @@
+pub mod config;
 mod graph;
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use usearch::{IndexOptions, ScalarKind};
+use usearch::ScalarKind;
 
 use crate::error::Error;
-use crate::protocol::{self, Create};
+use config::options_of;
+pub use config::{config_of, is_config};
 pub use graph::Graph;
 
 /// An index with the address of the Map that holds it, so that the late events of a dropped Map
@@ -83,75 +85,18 @@ fn write() -> RwLockWriteGuard<'static, HashMap<String, Entry>> {
     INDEXES.write().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Whether a map value is marked as an index's config, `{ "type": "vector", ... }`.
-pub fn is_config(value: &[u8]) -> bool {
-    bson::RawDocument::from_bytes(value)
-        .is_ok_and(|doc| doc.get_str("type").is_ok_and(|kind| kind == "vector"))
-}
-
-/// `{ "type": "vector", "dim", "metric", "quant", "M", "efc", "efs" }`
-fn options_of(config: &[u8]) -> Option<IndexOptions> {
-    let doc = bson::Document::from_reader(config).ok()?;
-    let int = |key| usize::try_from(doc.get_i32(key).ok()?).ok();
-    Some(IndexOptions {
-        dimensions: int("dim")?,
-        metric: protocol::parse_metric(doc.get_str("metric").ok()?)?,
-        quantization: protocol::parse_quant(doc.get_str("quant").ok()?)?,
-        connectivity: int("M")?,
-        expansion_add: int("efc")?,
-        expansion_search: int("efs")?,
-        multi: false,
-    })
-}
-
-/// The config `vop create` stores as its map's value.
-pub fn config_of(create: &Create<'_>) -> Result<Vec<u8>, Error> {
-    let int = |n: usize| i32::try_from(n).map_err(|_| Error::BadCommandLine);
-    bson::doc! {
-        "type": "vector",
-        "dim": i32::from(create.dim),
-        "metric": protocol::metric_word(create.metric),
-        "quant": protocol::quant_word(create.quant),
-        "M": int(create.m)?,
-        "efc": int(create.efc)?,
-        "efs": int(create.efs)?,
-    }
-    .to_vec()
-    .map_err(|_| Error::Internal)
-}
-
-/// A config for an index of `dim` dimensions, with the default graph parameters.
 #[cfg(test)]
-pub fn test_config(dim: i32, metric: &str, quant: &str) -> Vec<u8> {
-    bson::doc! {
-        "type": "vector", "dim": dim, "metric": metric, "quant": quant, "M": 16, "efc": 128,
-        "efs": 64,
-    }
-    .to_vec()
-    .unwrap()
-}
-
-#[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    #[test]
-    fn a_create_line_reads_back_from_its_config() {
-        let line = "vop create back 8 0 metric hamming quant b1 M 8 efc 40 efs 20";
-        let Ok(protocol::Request::Create(create)) =
-            protocol::parse(protocol::Tokens::from_line(line).words())
-        else {
-            panic!("a create line");
-        };
-        let config = config_of(&create).unwrap();
-        assert!(is_config(&config));
-        let options = options_of(&config).unwrap();
-        assert_eq!((options.dimensions, options.connectivity), (8, 8));
-        assert_eq!((options.expansion_add, options.expansion_search), (40, 20));
-        assert_eq!(
-            (options.metric, options.quantization),
-            (create.metric, create.quant)
-        );
+    /// A config for an index of `dim` dimensions, with the default graph parameters.
+    pub fn test_config(dim: i32, metric: &str, quant: &str) -> Vec<u8> {
+        bson::doc! {
+            "type": "vector", "dim": dim, "metric": metric, "quant": quant, "M": 16, "efc": 128,
+            "efs": 64,
+        }
+        .to_vec()
+        .unwrap()
     }
 
     #[test]
@@ -187,19 +132,6 @@ mod tests {
         };
         assert_eq!(create("fromcfg", 0, &config.to_vec().unwrap()), Ok(()));
         assert_eq!(layout("fromcfg"), Some((8, ScalarKind::F16)));
-    }
-
-    #[test]
-    fn only_a_value_marked_as_vector_is_a_config() {
-        assert!(!is_config(b"hello"));
-        assert!(!is_config(&bson::doc! { "dim": 8 }.to_vec().unwrap()));
-        assert!(!is_config(
-            &bson::doc! { "type": "other" }.to_vec().unwrap()
-        ));
-        assert!(!is_config(&bson::doc! { "type": 1 }.to_vec().unwrap()));
-        assert!(is_config(
-            &bson::doc! { "type": "vector" }.to_vec().unwrap()
-        ));
     }
 
     #[test]

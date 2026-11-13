@@ -1,13 +1,23 @@
+//! The vop ASCII extension: the lines the core hands over, read into requests.
+
+mod body;
+mod parse;
+mod request;
+mod tokens;
+
 use std::cell::Cell;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 
-use crate::cmd;
+use crate::exec::command;
 use crate::guard;
 use crate::memcached::ffi::{AUTHZ_NONE, EXTENSION_ASCII_PROTOCOL_DESCRIPTOR, token_t};
 use crate::memcached::server::{Connection, ResponseHandler};
-use crate::nread::{self, Body};
-use crate::protocol::{self, Tokens};
+use body::Body;
+pub use body::Pending;
+pub use parse::parse;
+pub use request::{Create, Format, Request, Search, SetMeta, Source, Upsert};
+pub use tokens::Tokens;
 
 const COMMAND: &str = "vop";
 
@@ -66,10 +76,10 @@ unsafe extern "C" fn accept(
             return false;
         }
         // `execute` answers a bad line.
-        let Ok(request) = protocol::parse(tokens.words()) else {
+        let Ok(request) = parse(tokens.words()) else {
             return true;
         };
-        let len = match nread::body(&request) {
+        let len = match body::body(&request) {
             Body::None => return true,
             Body::Read(len) => len,
             Body::Refuse => return close(),
@@ -80,7 +90,7 @@ unsafe extern "C" fn accept(
         };
         // SAFETY: the server is running `accept` for `cookie`.
         let conn = unsafe { Connection::new(cookie, None) };
-        let Some(buffer) = nread::expect(conn, tokens.words(), len) else {
+        let Some(buffer) = body::expect(conn, tokens.words(), len) else {
             return close();
         };
         *ndata = len;
@@ -111,12 +121,12 @@ unsafe extern "C" fn execute(
                 let Some(pending) = conn.take_kept() else {
                     return false;
                 };
-                return cmd::run(conn, pending.request());
+                return command::run(conn, pending.request());
             }
             // SAFETY: the caller guarantees `Tokens::new`'s contract.
-            let request = unsafe { Tokens::new(argv, argc) }
-                .and_then(|tokens| protocol::parse(tokens.words()));
-            cmd::run(conn, request)
+            let request =
+                unsafe { Tokens::new(argv, argc) }.and_then(|tokens| parse(tokens.words()));
+            command::run(conn, request)
         },
     )
 }
@@ -135,9 +145,37 @@ unsafe extern "C" fn abort(_cmd_cookie: *const c_void, cookie: *const c_void) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use crate::protocol::tokenize;
+
+    /// The returned buffer owns the bytes the tokens point into, so it must outlive them.
+    pub fn tokenize(line: &str) -> (Vec<u8>, Vec<token_t>) {
+        let mut buf = line.as_bytes().to_vec();
+        let mut spans = Vec::new();
+        let mut start = 0;
+        for (i, byte) in buf.iter_mut().enumerate() {
+            if *byte == b' ' {
+                if start != i {
+                    spans.push((start, i - start));
+                }
+                *byte = 0;
+                start = i + 1;
+            }
+        }
+        if start != buf.len() {
+            spans.push((start, buf.len() - start));
+        }
+        let base = buf.as_mut_ptr();
+        let tokens = spans
+            .into_iter()
+            .map(|(off, len)| token_t {
+                // SAFETY: every span starts inside `buf`, so `base.add(off)` stays in bounds.
+                value: unsafe { base.add(off) }.cast(),
+                length: len,
+            })
+            .collect();
+        (buf, tokens)
+    }
 
     fn token(text: &str) -> token_t {
         token_t {
@@ -234,7 +272,7 @@ mod tests {
             reply_to("vop create noengine 2 0"),
             "SERVER_ERROR internal\r\n"
         );
-        let config = crate::index::test_config(2, "cos", "f32");
+        let config = crate::index::tests::test_config(2, "cos", "f32");
         assert_eq!(crate::index::create("noengine", 0, &config), Ok(()));
         assert_eq!(reply_to("vop drop noengine"), "SERVER_ERROR internal\r\n");
     }
@@ -310,7 +348,7 @@ mod tests {
 
     #[test]
     fn a_vector_of_other_dimensions_is_a_bad_value() {
-        let config = crate::index::test_config(2, "cos", "f32");
+        let config = crate::index::tests::test_config(2, "cos", "f32");
         assert_eq!(crate::index::create("twodim", 0, &config), Ok(()));
         assert_eq!(
             reply_to_body("vop upsert twodim k1 4", b"abcd\r\n"),
@@ -348,7 +386,7 @@ mod tests {
 
     #[test]
     fn a_refused_body_closes_the_connection() {
-        let line = format!("vop setmeta idx k1 {}", protocol::MAX_BODY_BYTES);
+        let line = format!("vop setmeta idx k1 {}", body::MAX_BODY_BYTES);
         assert_eq!(reply_to_body(&line, b""), Err("closed"));
     }
 

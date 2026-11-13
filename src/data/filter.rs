@@ -256,7 +256,7 @@ mod tests {
     }
 
     fn on(src: &str, json: &str) -> bool {
-        let doc = crate::bson::from_json(json.as_bytes()).unwrap();
+        let doc = crate::data::meta::from_json(json.as_bytes()).unwrap();
         parse(src)
             .unwrap()
             .matches(RawDocument::from_bytes(&doc).unwrap())

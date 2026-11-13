@@ -2,10 +2,10 @@ use std::borrow::Cow;
 use std::cell::Cell;
 use std::os::raw::c_void;
 
-use crate::aio::{self, Op, Waiter};
 use crate::error::Error;
 use crate::guard;
 use crate::index;
+use crate::lane::{self, Op, Waiter};
 use crate::memcached::engine::{Elem, Item};
 use crate::memcached::ffi::{
     ENGINE_EVENT_TYPE, ENGINE_EVENT_TYPE_ON_EVENT_ITEM, event_data_t,
@@ -174,7 +174,7 @@ unsafe extern "C" fn on_item_event(
                 op,
                 Op::Insert { .. } | Op::Replace { .. } | Op::SetMeta { .. }
             );
-            if aio::begin(op, waiter) && holds {
+            if lane::begin(op, waiter) && holds {
                 // The graph keeps the inserted or new element, read in place, until a later event
                 // takes it out.
                 ev.target_ref = 1;
@@ -234,7 +234,7 @@ mod tests {
     #[test]
     fn an_event_the_engine_cannot_name_leaves_the_conn() {
         fake::install();
-        aio::start_once();
+        lane::tests::start_once();
         let (tx, rx) = channel();
         let conn = fake::Conn::new(12, &tx);
         // The tests have no engine to read the index from.
