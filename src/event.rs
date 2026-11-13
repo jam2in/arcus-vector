@@ -5,6 +5,7 @@ use std::os::raw::c_void;
 use crate::aio::{self, Op, Waiter};
 use crate::error::Error;
 use crate::guard;
+use crate::index;
 use crate::memcached::engine::Item;
 use crate::memcached::ffi::{
     ENGINE_EVENT_TYPE, ENGINE_EVENT_TYPE_ON_EVENT_ITEM, event_data_t,
@@ -92,9 +93,17 @@ fn claim(op: Op) -> (Op, Option<Waiter>) {
         return (op, None);
     }
     let op = match op {
-        Op::Replace { index, old, new } if pending.expect == Expect::SetMeta => {
-            Op::SetMeta { index, old, new }
-        }
+        Op::Replace {
+            index,
+            map,
+            old,
+            new,
+        } if pending.expect == Expect::SetMeta => Op::SetMeta {
+            index,
+            map,
+            old,
+            new,
+        },
         op => op,
     };
     (op, Some(pending.waiter))
@@ -105,22 +114,24 @@ fn op_of(ev: &event_data_t) -> Option<Op> {
         EVENT_ITEM_LINK | EVENT_ITEM_UNLINK => ev.target,
         _ => ev.coll_item,
     };
-    let map = Item::new(map.expose_provenance()).ok()?;
-    let index = owned(map.key()?)?;
+    let map = map.expose_provenance();
+    let item = Item::new(map).ok()?;
+    let index = owned(item.key()?)?;
     let (key, old) = (ev.target.expose_provenance(), ev.source.expose_provenance());
     match ev.type_ {
         EVENT_ITEM_LINK => {
-            let config = map.value()?.to_vec();
-            Some(Op::Create { index, config })
+            let config = item.value().filter(|v| index::is_config(v))?.to_vec();
+            Some(Op::Create { index, map, config })
         }
-        EVENT_ITEM_UNLINK => Some(Op::Drop { index }),
-        EVENT_ELEM_INSERT => Some(Op::Insert { index, key }),
+        EVENT_ITEM_UNLINK => Some(Op::Drop { index, map }),
+        EVENT_ELEM_INSERT => Some(Op::Insert { index, map, key }),
         EVENT_ELEM_REPLACE => Some(Op::Replace {
             index,
+            map,
             old,
             new: key,
         }),
-        EVENT_ELEM_DELETE => Some(Op::Delete { index, key }),
+        EVENT_ELEM_DELETE => Some(Op::Delete { index, map, key }),
         _ => None,
     }
 }
@@ -146,8 +157,9 @@ unsafe extern "C" fn on_item_event(
     guard(
         || (),
         || {
-            // SAFETY: the caller guarantees a non-null `data` is a live `event_data_t`.
-            let Some(ev) = (unsafe { data.cast::<event_data_t>().as_ref() }) else {
+            // SAFETY: the caller guarantees a non-null `data` is a live `event_data_t`; the engine
+            // reads back the reference counts we set in it.
+            let Some(ev) = (unsafe { data.cast_mut().cast::<event_data_t>().as_mut() }) else {
                 return;
             };
             let Some(op) = op_of(ev) else {
@@ -155,7 +167,15 @@ unsafe extern "C" fn on_item_event(
             };
             // None for a change from replication or replay, or one the write did not ask for.
             let (op, waiter) = claim(op);
-            aio::begin(op, waiter);
+            let holds = matches!(
+                op,
+                Op::Insert { .. } | Op::Replace { .. } | Op::SetMeta { .. }
+            );
+            if aio::begin(op, waiter) && holds {
+                // The graph keeps the inserted or new element, read in place, until a later event
+                // takes it out.
+                ev.target_ref = 1;
+            }
         },
     );
 }
@@ -182,8 +202,8 @@ mod tests {
 
     #[test]
     fn the_callback_takes_an_event_and_a_null() {
-        let ev = event(EVENT_ELEM_INSERT, 8, 16, 0);
-        for data in [(&raw const ev).cast(), ptr::null()] {
+        let mut ev = event(EVENT_ELEM_INSERT, 8, 16, 0);
+        for data in [(&raw mut ev).cast_const().cast(), ptr::null()] {
             // SAFETY: `ev` outlives the call, and its item and elements are never read.
             unsafe {
                 on_item_event(
@@ -196,13 +216,13 @@ mod tests {
         }
     }
 
-    fn raise(ev: &event_data_t) {
+    fn raise(ev: &mut event_data_t) {
         // SAFETY: `ev` outlives the call, and its item and elements are never read.
         unsafe {
             on_item_event(
                 ptr::null(),
                 ENGINE_EVENT_TYPE_ON_EVENT_ITEM,
-                ptr::from_ref(ev).cast(),
+                ptr::from_mut(ev).cast_const().cast(),
                 ptr::null(),
             );
         }
@@ -216,7 +236,7 @@ mod tests {
         let conn = fake::Conn::new(12, &tx);
         // The tests have no engine to read the index from.
         offer(conn.connection(), Expect::Upsert, || {
-            raise(&event(EVENT_ELEM_INSERT, 8, 16, 0));
+            raise(&mut event(EVENT_ELEM_INSERT, 8, 16, 0));
             Ok(())
         });
         assert!(PENDING.take().is_none());
@@ -247,6 +267,7 @@ mod tests {
         };
         let replace = Op::Replace {
             index: "idx".into(),
+            map: 1,
             old: 2,
             new: 3,
         };
@@ -254,10 +275,12 @@ mod tests {
         assert!(matches!(claim(replace), (Op::SetMeta { .. }, Some(_))));
         let evicted = Op::Delete {
             index: "other".into(),
+            map: 4,
             key: 6,
         };
         let insert = Op::Insert {
             index: "idx".into(),
+            map: 1,
             key: 5,
         };
         PENDING.set(Some(pending()));

@@ -4,6 +4,7 @@ mod aio;
 mod ascii;
 mod bson;
 mod cmd;
+mod element;
 mod error;
 mod event;
 mod index;

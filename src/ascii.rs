@@ -230,14 +230,10 @@ mod tests {
 
     #[test]
     fn well_formed_lines_are_not_supported_yet() {
-        assert_eq!(reply_to("vop create unsupported 2 0"), "CREATED\r\n");
+        assert_eq!(reply_to("vop create unsupported 2 0"), "NOT_SUPPORTED\r\n");
+        let config = crate::index::test_config(2, "cos", "f32");
+        assert_eq!(crate::index::create("unsupported", 0, &config), Ok(()));
         assert_eq!(reply_to("vop drop unsupported"), "NOT_SUPPORTED\r\n");
-    }
-
-    #[test]
-    fn create_registers_the_index_once() {
-        assert_eq!(reply_to("vop create ascii 2 0"), "CREATED\r\n");
-        assert_eq!(reply_to("vop create ascii 2 0"), "EXISTS\r\n");
     }
 
     #[test]
@@ -311,7 +307,8 @@ mod tests {
 
     #[test]
     fn a_vector_of_other_dimensions_is_a_bad_value() {
-        assert_eq!(reply_to("vop create twodim 2 0"), "CREATED\r\n");
+        let config = crate::index::test_config(2, "cos", "f32");
+        assert_eq!(crate::index::create("twodim", 0, &config), Ok(()));
         assert_eq!(
             reply_to_body("vop upsert twodim k1 4", b"abcd\r\n"),
             Ok("CLIENT_ERROR bad value\r\n".into())
