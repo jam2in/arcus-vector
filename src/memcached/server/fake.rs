@@ -1,7 +1,6 @@
 //! A core API for unit tests, where each cookie is a [`Conn`].
 
 use std::cell::Cell;
-use std::mem;
 use std::os::raw::c_int;
 use std::ptr;
 use std::sync::mpsc::Sender;
@@ -129,16 +128,12 @@ unsafe extern "C" fn server_version() -> *const c_char {
 
 /// A server handle with every table and function arcus-vector uses, each table leaked.
 pub fn server() -> SERVER_HANDLE_V1 {
-    // SAFETY: all-zero is a valid handle and API table: null pointers and `None` functions.
-    let (mut server, core, log, extension, callback) = unsafe {
-        (
-            mem::zeroed::<SERVER_HANDLE_V1>(),
-            Box::leak(Box::new(mem::zeroed::<SERVER_CORE_API>())),
-            Box::leak(Box::new(mem::zeroed::<SERVER_LOG_API>())),
-            Box::leak(Box::new(mem::zeroed::<SERVER_EXTENSION_API>())),
-            Box::leak(Box::new(mem::zeroed::<SERVER_CALLBACK_API>())),
-        )
-    };
+    // Null pointers and `None` functions.
+    let mut server = SERVER_HANDLE_V1::default();
+    let core = Box::leak(Box::new(SERVER_CORE_API::default()));
+    let log = Box::leak(Box::new(SERVER_LOG_API::default()));
+    let extension = Box::leak(Box::new(SERVER_EXTENSION_API::default()));
+    let callback = Box::leak(Box::new(SERVER_CALLBACK_API::default()));
     core.server_version = Some(server_version);
     core.waitfor_io_complete = Some(waitfor_io_complete);
     core.notify_io_complete = Some(notify_io_complete);

@@ -11,8 +11,8 @@ use crate::error::Error;
 use crate::exec::event::{self, Expect};
 use crate::index::{self, Graph};
 use crate::lane::{self, Op, Waiter};
-use crate::memcached::engine::{self, Store};
-use crate::memcached::server::{self, Connection};
+use crate::memcached::engine::Store;
+use crate::memcached::server::Connection;
 
 /// A reply now, or `None` once a lane has the connection to reply to.
 type Reply = Option<Cow<'static, [u8]>>;
@@ -32,18 +32,18 @@ fn execute(conn: Connection, request: Request<'_>) -> Result<Reply, Error> {
             // The config is the new map's value; its link event registers the index.
             let mut config = index::config_of(&c)?;
             config.extend_from_slice(b"\r\n");
-            let attr = engine::map_attr(c.maxcount, server::realtime(c.exptime));
             let store = Store::of(conn)?;
             if index::get(c.index).is_some() {
-                if store.exists(c.index)? {
-                    return Err(Error::Exists);
+                match store.exist(c.index) {
+                    Ok(()) => return Err(Error::Exists),
+                    // Dropped or expired, with its unlink not yet run on its lane; waits out the
+                    // commands in it.
+                    Err(Error::NotFound) => index::retire(c.index),
+                    Err(e) => return Err(e),
                 }
-                // Dropped or expired, with its unlink not yet run on its lane; waits out the commands
-                // in it.
-                index::retire(c.index);
             }
             event::offer(conn, Expect::Create, || {
-                store.create_map(c.index, &config, attr)
+                store.create(c.index, &config, c.maxcount, c.exptime)
             });
             Ok(None)
         }
@@ -55,7 +55,7 @@ fn execute(conn: Connection, request: Request<'_>) -> Result<Reply, Error> {
             }
             let value = element::join(&u.meta, &u.vector.to_bytes())?;
             event::offer(conn, Expect::Upsert, || {
-                store.upsert_elem(u.index, u.vkey, &value)
+                store.upsert(u.index, u.vkey, &value)
             });
             Ok(None)
         }
@@ -66,21 +66,25 @@ fn execute(conn: Connection, request: Request<'_>) -> Result<Reply, Error> {
             // The replace fills the vector from the element it replaces, as the engine holds it.
             let value = element::with_blank_vector(&s.meta, vector::byte_len(dim, kind))?;
             event::offer(conn, Expect::SetMeta, || {
-                store.update_elem(s.index, s.vkey, &value)
+                store.update(s.index, s.vkey, &value)
             });
             Ok(None)
         }
         Request::GetMeta { index, vkey } => {
             let (_, store) = open(conn, index)?;
-            let value = store.get_elem(index, vkey)?;
-            let (doc, _) = element::split(&value).ok_or(Error::Internal)?;
-            let json = meta::to_json(doc)?;
+            let elem = store.get(index, vkey)?;
+            let json = elem
+                .meta()
+                .ok_or(Error::Internal)
+                .and_then(|doc| meta::to_json(doc.as_bytes()));
+            elem.release();
+            let json = json?;
             let reply = format!("META {vkey} {}\r\n{json}\r\n", json.len());
             Ok(Some(Cow::Owned(reply.into_bytes())))
         }
         Request::Delete { index, vkey } => {
             let (_, store) = open(conn, index)?;
-            event::offer(conn, Expect::Delete, || store.delete_elem(index, vkey));
+            event::offer(conn, Expect::Delete, || store.delete(index, vkey));
             Ok(None)
         }
         Request::Drop { index } => {
@@ -93,9 +97,10 @@ fn execute(conn: Connection, request: Request<'_>) -> Result<Reply, Error> {
             let entered = graph.enter().ok_or(Error::NotFound)?;
             let (dim, kind) = graph.layout();
             if let Source::Vkey(vkey) = search.source {
-                let value = store.get_elem(search.index, vkey)?;
-                let (_, bytes) = element::split(&value).ok_or(Error::Internal)?;
-                search.vector = Vector::from_bytes(bytes, kind).ok_or(Error::Internal)?;
+                let elem = store.get(search.index, vkey)?;
+                let vector = elem.vector(kind);
+                elem.release();
+                search.vector = vector.ok_or(Error::Internal)?;
             } else if !fits(&search.vector, (dim, kind)) {
                 return Err(Error::NotFound);
             }
@@ -110,8 +115,8 @@ fn execute(conn: Connection, request: Request<'_>) -> Result<Reply, Error> {
 /// there is of another type.
 fn open(conn: Connection, index: &str) -> Result<(Arc<Graph>, Store), Error> {
     let Some(graph) = index::get(index) else {
-        let other = Store::of(conn).and_then(|store| store.exists(index));
-        return Err(if other == Ok(true) {
+        let other = Store::of(conn).and_then(|store| store.exist(index));
+        return Err(if other.is_ok() {
             Error::TypeMismatch
         } else {
             Error::NotFound
