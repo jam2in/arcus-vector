@@ -25,6 +25,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     bindgen::Builder::default()
         .header(ENGINE_HEADER)
+        .derive_default(true)
         .clang_arg("-Iinclude")
         .clang_arg("-I.")
         .clang_args(["-include", "config.h"])
