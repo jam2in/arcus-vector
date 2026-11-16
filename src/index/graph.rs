@@ -75,7 +75,8 @@ impl Graph {
     }
 
     pub fn add(&self, key: u64, vector: &Vector) -> Result<(), Error> {
-        self.reserve(self.len() + 1)?;
+        // Room for an add on every lane at once, as each checks before it adds.
+        self.reserve(self.len() + NUM_LANES)?;
         let index = self.read();
         match vector {
             Vector::F32(v) => index.add(key, v),
@@ -296,11 +297,14 @@ mod tests {
     }
 
     #[test]
-    fn its_lane_adds_while_others_search_as_it_grows() {
+    fn lanes_add_while_others_search_as_it_grows() {
+        // Each thread takes one of the graph's per-lane slots, as a lane does.
+        const SEARCHERS: u64 = 3;
+        const ADDERS: u64 = NUM_LANES as u64 - SEARCHERS;
         let g = graph(4, ScalarKind::F32);
         thread::scope(|s| {
             let g = &g;
-            for t in 0..3u64 {
+            for t in 0..SEARCHERS {
                 s.spawn(move || {
                     for n in 0..600u64 {
                         let q = vector(&[t as f32, n as f32, 1.0, 0.0], ScalarKind::F32);
@@ -308,9 +312,14 @@ mod tests {
                     }
                 });
             }
-            for n in 0..2400u64 {
-                let v = vector(&[(n % 4) as f32, (n / 4) as f32, 1.0, 0.0], ScalarKind::F32);
-                assert_eq!(g.add(n, &v), Ok(()));
+            for lane in 0..ADDERS {
+                s.spawn(move || {
+                    for n in (lane..2400).step_by(ADDERS as usize) {
+                        let v =
+                            vector(&[(n % 4) as f32, (n / 4) as f32, 1.0, 0.0], ScalarKind::F32);
+                        assert_eq!(g.add(n, &v), Ok(()));
+                    }
+                });
             }
         });
         assert_eq!(g.len(), 2400);

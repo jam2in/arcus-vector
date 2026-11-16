@@ -5,10 +5,12 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use super::{Waiter, ops, sweeper};
 use crate::error::Error;
 use crate::filter::Filter;
+use crate::memcached::engine::Elem;
 use crate::protocol::{Request, Search};
 use crate::quant::Vector;
 
@@ -56,18 +58,19 @@ impl Op {
         }
     }
 
-    /// A search goes to the least busy lane; a change goes to its index's lane, so that changes to
-    /// one index run in the order the engine made them. A shutdown goes to every lane, from
-    /// [`close`].
+    /// A search goes to the least busy lane. A change to an element goes to its vkey's lane, so
+    /// that the changes to one vkey run in the order the engine made them; a create or a drop to
+    /// its index's. A shutdown goes to every lane, from [`close`].
     fn lane(&self) -> Option<&'static Lane> {
         match self {
             Self::Search { .. } => Some(idlest()),
-            Self::Insert { index, .. }
-            | Self::Replace { index, .. }
-            | Self::SetMeta { index, .. }
-            | Self::Delete { index, .. }
-            | Self::Create { index, .. }
-            | Self::Drop { index, .. } => Some(lane_of(index)),
+            Self::Insert { index, key, .. } | Self::Delete { index, key, .. } => {
+                Some(lane_of(index, vkey_of(*key).as_deref()))
+            }
+            Self::Replace { index, new, .. } | Self::SetMeta { index, new, .. } => {
+                Some(lane_of(index, vkey_of(*new).as_deref()))
+            }
+            Self::Create { index, .. } | Self::Drop { index, .. } => Some(lane_of(index, None)),
             Self::Shutdown => None,
         }
     }
@@ -82,8 +85,42 @@ impl Task {
     }
 }
 
+/// What a lane runs: a task, or a stop that keeps it in step with a create on another lane.
+enum Job {
+    Task(Task),
+    /// Holds the lane until the create it waits on has run.
+    Wait(Arc<Gate>),
+    /// Lets the lanes waiting on its create go, once it runs or drops unrun.
+    Open(Opener),
+}
+
+#[derive(Default)]
+struct Gate {
+    open: Mutex<bool>,
+    opened: Condvar,
+}
+
+impl Gate {
+    fn wait(&self) {
+        let open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        let _open = self
+            .opened
+            .wait_while(open, |open| !*open)
+            .unwrap_or_else(PoisonError::into_inner);
+    }
+}
+
+struct Opener(Arc<Gate>);
+
+impl Drop for Opener {
+    fn drop(&mut self) {
+        *self.0.open.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.0.opened.notify_all();
+    }
+}
+
 struct Lane {
-    tasks: Sender<Task>,
+    jobs: Sender<Job>,
     /// Queued plus running jobs, to pick the least busy lane.
     load: AtomicUsize,
     closed: AtomicBool,
@@ -115,10 +152,10 @@ pub fn shutdown() {
 
 fn close(lane: &Lane) {
     lane.closed.store(true, Ordering::Release);
-    let _ = lane.tasks.send(Task {
+    let _ = lane.jobs.send(Job::Task(Task {
         op: Op::Shutdown,
         waiter: None,
-    });
+    }));
 }
 
 /// Starts the lanes and the sweeper; `false` if a thread could not be made, leaving those that
@@ -126,10 +163,10 @@ fn close(lane: &Lane) {
 fn spawn() -> bool {
     let mut receivers = Vec::with_capacity(NUM_LANES);
     let lanes: &'static [Lane; NUM_LANES] = Box::leak(Box::new(std::array::from_fn(|_| {
-        let (tasks, rx) = channel();
+        let (jobs, rx) = channel();
         receivers.push(rx);
         Lane {
-            tasks,
+            jobs,
             load: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
         }
@@ -208,10 +245,16 @@ fn idlest() -> &'static Lane {
     idlest
 }
 
-fn lane_of(index: &str) -> &'static Lane {
+fn lane_of(index: &str, vkey: Option<&[u8]>) -> &'static Lane {
     let mut hasher = DefaultHasher::new();
     index.hash(&mut hasher);
+    vkey.hash(&mut hasher);
     &lanes()[(hasher.finish() % NUM_LANES as u64) as usize]
+}
+
+/// Read while the engine raises the element's event, which keeps it alive.
+fn vkey_of(elem: usize) -> Option<Vec<u8>> {
+    Elem::new(elem).ok()?.field().map(<[u8]>::to_vec)
 }
 
 /// Runs `op` on its lane, which then answers `waiter`.
@@ -219,14 +262,38 @@ pub fn submit(op: Op, waiter: Option<Waiter>) -> bool {
     let Some(lane) = op.lane() else {
         return false;
     };
-    send(lane, Task { op, waiter })
+    let task = Task { op, waiter };
+    if matches!(task.op, Op::Create { .. }) {
+        create(lane, task)
+    } else {
+        send(lane, task)
+    }
+}
+
+/// Holds every other lane until the create has run, so that the changes the engine makes after
+/// it, on any lane, find its index.
+fn create(lane: &'static Lane, task: Task) -> bool {
+    // One create at a time, or two could each wait on a lane that waits on the other.
+    static ONE: Mutex<()> = Mutex::new(());
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let gate = Arc::new(Gate::default());
+    for other in lanes().iter().filter(|other| !ptr::eq(*other, lane)) {
+        post(other, Job::Wait(Arc::clone(&gate)));
+    }
+    let sent = send(lane, task);
+    post(lane, Job::Open(Opener(gate)));
+    sent
 }
 
 /// `false` only if the lane has ended; the task then drops, answering its connection an internal
 /// error.
 fn send(lane: &Lane, task: Task) -> bool {
+    post(lane, Job::Task(task))
+}
+
+fn post(lane: &Lane, job: Job) -> bool {
     lane.load.fetch_add(1, Ordering::Relaxed);
-    match lane.tasks.send(task) {
+    match lane.jobs.send(job) {
         Ok(()) => true,
         Err(_) => {
             lane.load.fetch_sub(1, Ordering::Relaxed);
@@ -235,13 +302,17 @@ fn send(lane: &Lane, task: Task) -> bool {
     }
 }
 
-fn run(lane: &Lane, tasks: &Receiver<Task>) {
-    for task in tasks {
+fn run(lane: &Lane, jobs: &Receiver<Job>) {
+    for job in jobs {
         if lane.closed.load(Ordering::Acquire) {
             break;
         }
-        // A panicking job must not kill the lane, or its later jobs would never run.
-        let _ = catch_unwind(AssertUnwindSafe(|| task.run()));
+        match job {
+            // A panicking job must not kill the lane, or its later jobs would never run.
+            Job::Task(task) => drop(catch_unwind(AssertUnwindSafe(|| task.run()))),
+            Job::Wait(gate) => gate.wait(),
+            Job::Open(opener) => drop(opener),
+        }
         lane.load.fetch_sub(1, Ordering::Relaxed);
     }
 }
@@ -280,9 +351,9 @@ mod tests {
     #[test]
     fn a_closed_lane_ends_and_drops_the_queued_jobs_unrun() {
         fake::install();
-        let (tasks, rx) = channel();
+        let (jobs, rx) = channel();
         let lane: &'static Lane = Box::leak(Box::new(Lane {
-            tasks,
+            jobs,
             load: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
         }));
@@ -323,12 +394,38 @@ mod tests {
     }
 
     #[test]
-    fn one_index_always_gets_one_lane() {
+    fn one_vkey_always_gets_one_lane_and_the_vkeys_of_an_index_spread() {
         start_once();
-        assert!(ptr::eq(lane_of("idx"), lane_of("idx")));
+        assert!(ptr::eq(
+            lane_of("idx", Some(b"v")),
+            lane_of("idx", Some(b"v"))
+        ));
         let spread = (0..1000)
-            .map(|n| ptr::from_ref(lane_of(&format!("idx{n}"))))
+            .map(|n| ptr::from_ref(lane_of("idx", Some(format!("v{n}").as_bytes()))))
             .collect::<HashSet<_>>();
         assert_eq!(spread.len(), NUM_LANES);
+    }
+
+    #[test]
+    fn a_lane_waits_until_the_create_before_it_has_run() {
+        let (jobs, rx) = channel();
+        let lane: &'static Lane = Box::leak(Box::new(Lane {
+            jobs,
+            load: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
+        }));
+        let gate = Arc::new(Gate::default());
+        post(lane, Job::Wait(Arc::clone(&gate)));
+        let (done, ran) = channel();
+        let waiting = std::thread::spawn(move || {
+            run(lane, &rx);
+            done.send(()).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        close(lane);
+        assert!(ran.try_recv().is_err());
+        drop(Opener(gate));
+        ran.recv_timeout(Duration::from_secs(10)).unwrap();
+        waiting.join().unwrap();
     }
 }
