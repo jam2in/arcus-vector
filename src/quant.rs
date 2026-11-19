@@ -1,4 +1,4 @@
-use numkong::{Dot, EachScale, cast, f16};
+use numkong::{EachScale, cast, f16};
 use usearch::ScalarKind;
 
 use crate::error::Error;
@@ -9,7 +9,7 @@ use crate::error::Error;
 pub enum Vector {
     F32(Vec<f32>),
     F16(Vec<f16>),
-    /// Scaled to unit length, then by 127, as usearch does: only cosine distance keeps its meaning.
+    /// Scaled so its largest magnitude is 127: only cosine distance keeps its meaning.
     I8(Vec<i8>),
     /// A bit per dimension, set where the value is positive; the first dimension is the high bit.
     B1(Vec<u8>),
@@ -78,17 +78,17 @@ fn to_f16(vector: &[f32]) -> Result<Vec<f16>, Error> {
     Ok(out)
 }
 
-/// Rounds to nearest even and saturates in `cast`; a zero or NaN length gives all zeros, as usearch
-/// does.
+/// Rounds to nearest even in `cast`; no finite magnitude, or a NaN, gives all zeros.
 fn to_i8(vector: &[f32]) -> Result<Vec<i8>, Error> {
     let mut out = vec![0; vector.len()];
-    let norm = f32::dot(vector, vector).ok_or(Error::Internal)?.sqrt();
-    if norm.is_nan() || norm <= 0.0 {
+    let max = vector
+        .iter()
+        .try_fold(0.0_f32, |max, x| (!x.is_nan()).then(|| max.max(x.abs())));
+    let Some(max) = max.filter(|max| max.is_finite() && *max > 0.0) else {
         return Ok(out);
-    }
+    };
     let mut scaled = vec![0.0; vector.len()];
-    let scale = (127.0 / norm) as f32;
-    f32::each_scale(vector, scale, 0.0, &mut scaled).ok_or(Error::Internal)?;
+    f32::each_scale(vector, 127.0 / max, 0.0, &mut scaled).ok_or(Error::Internal)?;
     cast(&scaled, &mut out).ok_or(Error::Internal)?;
     Ok(out)
 }
@@ -139,13 +139,12 @@ mod tests {
     }
 
     #[test]
-    fn i8_scales_to_unit_length_and_rounds() {
-        // Length 5: 3/5 * 127 = 76.2 and 4/5 * 127 = 101.6.
+    fn i8_scales_the_largest_magnitude_to_127_and_rounds() {
+        // 3/4 * 127 = 95.25.
         assert_eq!(
             quantize(vec![3.0, -4.0], ScalarKind::I8),
-            Ok(Vector::I8(vec![76, -102]))
+            Ok(Vector::I8(vec![95, -127]))
         );
-        // One axis takes all of the length.
         assert_eq!(
             quantize(vec![0.0, 9.0, 0.0], ScalarKind::I8),
             Ok(Vector::I8(vec![0, 127, 0]))
@@ -160,6 +159,10 @@ mod tests {
         );
         assert_eq!(
             quantize(vec![f32::NAN, 1.0], ScalarKind::I8),
+            Ok(Vector::I8(vec![0, 0]))
+        );
+        assert_eq!(
+            quantize(vec![f32::INFINITY, 1.0], ScalarKind::I8),
             Ok(Vector::I8(vec![0, 0]))
         );
     }
