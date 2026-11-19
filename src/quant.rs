@@ -9,7 +9,8 @@ use crate::error::Error;
 pub enum Vector {
     F32(Vec<f32>),
     F16(Vec<f16>),
-    /// Scaled so its largest magnitude is 127: only cosine distance keeps its meaning.
+    /// Turned by a fixed rotation, then scaled so its largest magnitude is 127: only cosine
+    /// distance keeps its meaning.
     I8(Vec<i8>),
     /// A bit per dimension, set where the value is positive; the first dimension is the high bit.
     B1(Vec<u8>),
@@ -52,11 +53,14 @@ impl Vector {
 }
 
 /// `vector` as `kind`, which must be one an index can be created with.
-pub fn quantize(vector: Vec<f32>, kind: ScalarKind) -> Result<Vector, Error> {
+pub fn quantize(mut vector: Vec<f32>, kind: ScalarKind) -> Result<Vector, Error> {
     match kind {
         ScalarKind::F32 => Ok(Vector::F32(vector)),
         ScalarKind::F16 => to_f16(&vector).map(Vector::F16),
-        ScalarKind::I8 => to_i8(&vector).map(Vector::I8),
+        ScalarKind::I8 => {
+            rotate(&mut vector);
+            to_i8(&vector).map(Vector::I8)
+        }
         ScalarKind::B1 => Ok(Vector::B1(to_b1(&vector))),
         _ => Err(Error::Internal),
     }
@@ -91,6 +95,58 @@ fn to_i8(vector: &[f32]) -> Result<Vec<i8>, Error> {
     f32::each_scale(vector, 127.0 / max, 0.0, &mut scaled).ok_or(Error::Internal)?;
     cast(&scaled, &mut out).ok_or(Error::Internal)?;
     Ok(out)
+}
+
+/// Turns `vector` by a fixed rotation that spreads its length over all of its dimensions, so a few
+/// large values do not leave the rest of an i8 only a few steps: rounds of random sign flips, each
+/// followed by a Hadamard transform of the leading and the trailing power-of-two block.
+fn rotate(vector: &mut [f32]) {
+    const ROUNDS: u64 = 2;
+    let dim = vector.len();
+    if dim < 2 {
+        return;
+    }
+    let block = 1 << dim.ilog2();
+    for round in 0..ROUNDS {
+        flip(vector, 2 * round);
+        hadamard(&mut vector[..block]);
+        if block != dim {
+            flip(vector, 2 * round + 1);
+            hadamard(&mut vector[dim - block..]);
+        }
+    }
+}
+
+fn flip(vector: &mut [f32], seed: u64) {
+    for (i, x) in (0_u64..).zip(vector) {
+        if splitmix((seed << 32) | i) >> 63 == 1 {
+            *x = -*x;
+        }
+    }
+}
+
+/// SplitMix64's finalizer: fixed, as every version must turn a vector the same way.
+const fn splitmix(x: u64) -> u64 {
+    let x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    let x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// The orthonormal Walsh-Hadamard transform of `block`, whose length is a power of two.
+fn hadamard(block: &mut [f32]) {
+    let mut half = 1;
+    while half < block.len() {
+        for pair in block.chunks_exact_mut(2 * half) {
+            let (low, high) = pair.split_at_mut(half);
+            for (a, b) in low.iter_mut().zip(high) {
+                (*a, *b) = (*a + *b, *a - *b);
+            }
+        }
+        half *= 2;
+    }
+    let scale = (block.len() as f32).sqrt().recip();
+    block.iter_mut().for_each(|x| *x *= scale);
 }
 
 fn to_b1(vector: &[f32]) -> Vec<u8> {
@@ -141,29 +197,61 @@ mod tests {
     #[test]
     fn i8_scales_the_largest_magnitude_to_127_and_rounds() {
         // 3/4 * 127 = 95.25.
-        assert_eq!(
-            quantize(vec![3.0, -4.0], ScalarKind::I8),
-            Ok(Vector::I8(vec![95, -127]))
-        );
-        assert_eq!(
-            quantize(vec![0.0, 9.0, 0.0], ScalarKind::I8),
-            Ok(Vector::I8(vec![0, 127, 0]))
-        );
+        assert_eq!(to_i8(&[3.0, -4.0]), Ok(vec![95, -127]));
+        assert_eq!(to_i8(&[0.0, 9.0, 0.0]), Ok(vec![0, 127, 0]));
     }
 
     #[test]
-    fn i8_of_no_length_is_zero() {
+    fn i8_of_no_finite_magnitude_is_zero() {
+        assert_eq!(to_i8(&[0.0, 0.0]), Ok(vec![0, 0]));
+        assert_eq!(to_i8(&[f32::NAN, 1.0]), Ok(vec![0, 0]));
+        assert_eq!(to_i8(&[f32::INFINITY, 1.0]), Ok(vec![0, 0]));
+    }
+
+    fn sample(dim: usize, seed: u64) -> Vec<f32> {
+        (0..dim as u64)
+            .map(|i| (splitmix((seed << 32) | i) >> 40) as f32 / (1 << 24) as f32 - 0.5)
+            .collect()
+    }
+
+    fn dot(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b).map(|(x, y)| x * y).sum()
+    }
+
+    #[test]
+    fn rotation_keeps_lengths_and_angles() {
+        for dim in [1, 2, 3, 8, 100, 768, 1536] {
+            let (a, b) = (sample(dim, 1), sample(dim, 2));
+            let (mut ra, mut rb) = (a.clone(), b.clone());
+            rotate(&mut ra);
+            rotate(&mut rb);
+            for (before, after) in [(dot(&a, &a), dot(&ra, &ra)), (dot(&a, &b), dot(&ra, &rb))] {
+                assert!(
+                    (before - after).abs() < 1e-4 * dim as f32,
+                    "{dim}: {before} {after}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rotation_spreads_one_axis_over_all() {
+        for dim in [768, 1024, 1536] {
+            let mut axis = vec![0.0; dim];
+            axis[dim - 1] = 1.0;
+            rotate(&mut axis);
+            let max = axis.iter().fold(0.0_f32, |max, x| max.max(x.abs()));
+            // Spread evenly, each would be 1/√dim.
+            assert!(max < 4.0 / (dim as f32).sqrt(), "{dim}: {max}");
+        }
+    }
+
+    #[test]
+    fn i8_turns_every_vector_the_same_way() {
+        // Pinned: a master and its slave, or two versions, must quantize alike.
         assert_eq!(
-            quantize(vec![0.0, 0.0], ScalarKind::I8),
-            Ok(Vector::I8(vec![0, 0]))
-        );
-        assert_eq!(
-            quantize(vec![f32::NAN, 1.0], ScalarKind::I8),
-            Ok(Vector::I8(vec![0, 0]))
-        );
-        assert_eq!(
-            quantize(vec![f32::INFINITY, 1.0], ScalarKind::I8),
-            Ok(Vector::I8(vec![0, 0]))
+            quantize(vec![1.0, 2.0, 3.0, 4.0, 5.0], ScalarKind::I8),
+            Ok(Vector::I8(vec![71, -127, 5, -15, 36]))
         );
     }
 
